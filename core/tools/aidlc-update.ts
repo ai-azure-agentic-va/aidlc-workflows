@@ -19,6 +19,7 @@ import {
   updateCachePath,
 } from "./aidlc-machine-config.ts";
 import {
+  defaultReleaseBaseUrl,
   fetchReleaseMetadata,
   ReleaseUnavailableError,
   resolvePreviewVersion,
@@ -296,7 +297,7 @@ export async function refreshUpdateState(
         message =
           `update refresh unavailable; the ${PREVIEW_CHANNEL} release list is too large to ` +
           `download. To update now, run \`aidlc update --version <id>\` with a ` +
-          `${PREVIEW_CHANNEL} id from https://github.com/awslabs/aidlc-workflows/releases`;
+          `${PREVIEW_CHANNEL} id from ${defaultReleaseBaseUrl()}`;
       }
     }
     return {

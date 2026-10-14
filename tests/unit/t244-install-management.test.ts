@@ -3759,7 +3759,7 @@ describe("t244 Windows and completion release surfaces", () => {
     const marker = join(root, "verified");
     writeFileSync(checksums, "checksums fixture\n");
     writeFileSync(bundle, "bundle fixture\n");
-    const repository = "awslabs/aidlc-workflows";
+    const repository = "ai-azure-agentic-va/aidlc-workflows";
     const signerWorkflow = `${repository}/.github/workflows/release.yml`;
     const sourceRef = `refs/tags/v${AIDLC_VERSION}`;
     const sourceDigest = "1".repeat(40);

@@ -11,13 +11,13 @@ Cursor, opencode, and GitHub Copilot.
 macOS, Linux, or WSL:
 
 ```bash
-curl -fsSL https://github.com/awslabs/aidlc-workflows/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/ai-azure-agentic-va/aidlc-workflows/releases/latest/download/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://github.com/awslabs/aidlc-workflows/releases/latest/download/install.ps1 | iex
+irm https://github.com/ai-azure-agentic-va/aidlc-workflows/releases/latest/download/install.ps1 | iex
 ```
 
 The native installer sets up everything AI-DLC needs, every harness runtime
