@@ -228,6 +228,13 @@ the older three-file snapshot convention. `/aidlc --doctor` reports the enabled
 plugins, per-plugin enabled-stage counts, and hard-fails if the graph's
 `enabled:false` flags disagree with `harness.json`.
 
+`aidlc config project --plugins` and `--cloud` change the same selection
+through the configuration refresh. That refresh replays the merged
+contributions of enabled plugins only: a plugin the new selection turns off
+loses its prose fragments, its recorded structural adds (when the refresh is
+staged from the project's own files), and its `plugin-contrib-<key>.json`
+sidecar, exactly as `select-plugins` strips them.
+
 `aidlc engine plugin list` is a separate installed-versus-composed status command; it
 does not print or change the project selection.
 
@@ -454,7 +461,7 @@ fragments:                    # PROSE — spliced into the stage body
 
 - **Structural surfaces** — **set union** into the target stage's source frontmatter. Commutative, order-independent, safe across uncoordinated authors. *Implemented today:* `produces`, `consumes` (artifact + `required` + `conditional_on`, each preserved), `sensors`, `scopes`, `requires_stage`, `required_sections`. `adds.scopes` carries two guard rails: the scope's identity file must already be installed (a name with no `scopes/<name>.md` would resolve as an all-SKIP phantom), and that installed file's `plugin:` frontmatter must name the contributing plugin exactly — putting a core stage under a core or foreign-plugin scope changes selection semantics the other owner never agreed to, and ownership comes from the file's declared owner, not a name-prefix rule (dash prefixes overlap across plugin names; a core scope declares no `plugin:` and never merges); a violating entry is dropped-with-log, never merged. `adds.requires_stage` set-unions ordering edges; an edge that cannot hold is dropped-with-log, never merged. The dependency must be an installed stage (core, or a plugin stage already on disk) other than the target, and it must compile before the target by the compiler's own rule: full pinned numbers compare (prefix, then index), a pinned row keeps its number when its stage moves phase directory, and only an unpinned stage takes its prefix from its phase directory. A stage the same compose adds is unpinned and seeds past its phase max, so an installed stage cannot require it within the same phase (ordering a plugin stage before a core one is RFC #1100); between two new same-phase stages the edge holds unless it would close a cycle. An edge to a stage a scope skips is vacuous there, exactly as core's own cross-scope edges are. Recorded edges are re-checked on every compose, runtime refresh and Cursor reinstall: one that no longer holds is removed from the stage and from the contribution sidecar (a still-declared edge merges again once it holds), and one the incoming runtime now declares itself passes to core, so a later disable never strips a core edge.
 - **Prose fragments** (`fragments` of step/question prose) — spliced into the stage body at the declared anchor, ordered deterministically by `(order, plugin)`. Each spliced block is wrapped in a content-hashed sentinel and its anchor/order/hash is persisted in the contribution sidecar, so re-composing is idempotent, an upgraded fragment replaces its prior block, prose-only plugins retain verifiable provenance, and blocks from separate plugins interleave by `(order, plugin)` regardless of hook-firing order. The agent reads base body + ordered fragments at runtime.
-- **No override, ever.** A contribution can only add. It cannot change a stage's `lead_agent`, relax a `consumes[].required`, remove a field, or replace existing step prose. A genuine need to *change* upstream behavior is a framework-level decision, never a quiet patch inside a plugin.
+- **No override, ever.** A contribution can only add. It cannot change a stage's `lead_agent`, relax a `consumes[].required`, remove a field, or replace existing step prose. A genuine need to *change* upstream behavior is a framework-level decision, never a quiet patch inside a plugin. The one framework-level seat a plugin may take is an [agent slot](#agent-slots) a core persona opens; that is a plugin *agent*, not a contribution, and it never edits stage source.
 
 **Fragment anchors:**
 
@@ -481,6 +488,7 @@ fragments:                    # PROSE — spliced into the stage body
 | Put an existing stage under a plugin scope | `adds.scopes` (own-plugin scopes only; installed identity file required) | ✅ implemented |
 | Inject phase policy / guardrails | ship `memory/phases/<p>.md` into the default-space seed (§7) | ⏳ deferred (not yet projected) |
 | Enrich a core persona (a collaboration bullet, a mandatory anchor) | `contributions/agents/<agent>.md` with `fragments` at `in:<H2>`, `after-preflight` or `end-of-body` | ✅ implemented (prose only; `adds.*` is refused with an advisory drop) |
+| Take the seat a core persona opens (the cloud platform) | a plugin agent with `slot: <name>` ([Agent slots](#agent-slots)) | ✅ implemented |
 
 ## 7. Method/rules, agents, knowledge, scopes, and activation
 
@@ -504,6 +512,36 @@ also migrates an existing persona only when it is an exact, unchanged,
 same-plugin copy from the pre-projection composer; edited or foreign files retain
 no-clobber behavior. An already-composed unsupported value is left in place with
 a degraded diagnostic that names the file to remove before re-compose.
+
+### Agent slots
+
+A core persona may open an **agent slot** with `slot: <name>` in its
+frontmatter; it holds the slot by default. A plugin persona that declares the
+same `slot:` (with `plugin: <plugin>`) fills it while its plugin is enabled:
+graph compile names the filler wherever a stage names the core default, as
+`lead_agent` and in `support_agents`. Stage source is untouched, so a disabled
+plugin compiles back to the core persona with no strip step. Only core opens a
+slot, so a plugin can take a seat core offers and never replace any other agent.
+Compile fails when an enabled plugin persona fills a slot no core agent opens,
+and when more than one enabled plugin fills the same slot; the error names each
+plugin and the command that chooses one. A disabled plugin's slot claim is
+inert.
+
+Core opens one slot, `cloud-platform`, held by `aidlc-aws-platform-agent`. The
+first-party `plugins/azure/` and `plugins/gcp/` each ship a persona that fills
+it (`azure-platform-agent`, `gcp-platform-agent`) with its own knowledge, plus
+prose contributions that tell the Operations and Pipeline & Deploy personas and
+the Feasibility, Environment Provisioning, and Feedback & Optimization stages
+which cloud's services to read for the AWS ones they name.
+`aidlc config project --cloud <aws|plugin>` is the project choice: it turns the
+named cloud plugin on and every other cloud plugin off (or all of them off for
+`aws`) in the `plugins` selection, which stays the one record of it, and writes
+an explicit selection, so any plugin installed later composes turned off. A
+plugin named `aws` fills the slot but is never a `--cloud` choice; every
+`--cloud` turns it off. `aidlc config project --show` reports the cloud in use
+and the choices, and a switch while work is open says which agent its platform
+stages now run with. Agents a plugin fills a slot with are spoken of by the
+seat's trade in stage narration ("the platform engineer").
 
 A plugin may also enrich a **core** persona through
 `contributions/agents/<agent>.md` (§6): prose fragments only, spliced into
@@ -655,7 +693,7 @@ wherever their scopes put them on-path.
 ## 10. Invariants
 
 - **Core is immutable.** No plugin ever edits `core/`.
-- **Additive-only.** Contributions add; they never override or remove.
+- **Additive-only.** Contributions add; they never override or remove. A plugin persona takes a stage seat only through an agent slot a core persona opens.
 - **Inert when off.** With every plugin disabled the workflow runs as bare core: plugin stages and scopes are filtered out and merged contributions are stripped, while the plugin files stay installed for re-enabling.
 - **One composer, host-triggered.** The same code composes wherever it runs; the only centrally pre-built artifact is bare core.
 - **A plugin IS a host plugin.** The packager emits real `.claude-plugin/` / `.codex-plugin/` / Copilot `.plugin/` / `.kiro-plugin/` / `.opencode-plugin/` / `.cursor-plugin/` manifests, installed through the host's native commands. AIDLC runs no distribution infrastructure.

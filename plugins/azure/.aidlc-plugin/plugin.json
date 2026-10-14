@@ -1,0 +1,14 @@
+{
+  "name": "azure",
+  "version": "0.1.0",
+  "description": "Microsoft Azure platform plugin: an Azure Platform Agent that takes the cloud-platform seat on the platform stages, Azure methodology knowledge, and Azure notes for the stages and personas that name AWS services.",
+  "author": { "name": "AWS AIDLC" },
+  "dependencies": ["core"],
+  "aidlc": {
+    "contributes": {
+      "agents": "agents/",
+      "knowledge": "knowledge/",
+      "overlays": "contributions/"
+    }
+  }
+}

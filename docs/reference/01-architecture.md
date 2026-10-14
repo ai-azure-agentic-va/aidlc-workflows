@@ -556,7 +556,10 @@ otherwise higher precedence than the record.
 `aidlc config project` stores MCP and completion answers in a schema-versioned
 `project` record while continuing to store plugin selection in the established
 top-level `plugins` array. Installed plugins are discovered from graph, scope,
-and plugin sidecar data. A project choice changed while a workflow is open is
+and plugin sidecar data. `--cloud` is no separate record: it rewrites that
+selection so one cloud plugin (a plugin whose persona fills the core
+`cloud-platform` agent slot) is on, or none for the core `aws` default, and
+`--show` derives the cloud from the selection and the installed personas. A project choice changed while a workflow is open is
 done like any refresh, and its output names the open work and the command that
 puts the earlier choice back.
 

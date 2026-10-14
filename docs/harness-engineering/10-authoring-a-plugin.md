@@ -313,6 +313,36 @@ into the Markdown persona and into the native agent file a harness builds
 from it (the Codex agent TOML, the OpenCode and Copilot native agents), and
 Kiro CLI's agent JSON loads its prompt from the Markdown persona.
 
+### Fill an agent slot
+
+A core persona can open an **agent slot**: a seat on its stages that one plugin
+persona may take. Core opens one, `cloud-platform`, held by
+`aidlc-aws-platform-agent`. A plugin agent that declares the same slot takes
+every stage seat the AWS agent holds while the plugin is on:
+
+```yaml
+---
+name: azure-platform-agent
+display_name: Azure Platform Agent
+plugin: azure
+slot: cloud-platform
+description: >
+  Azure solutions architect ...
+disallowedTools: Task
+tier: judgment
+---
+```
+
+Nothing else is needed for the seat: graph compile names your agent on those
+stages, and turning the plugin off gives them back. Ship the agent's knowledge
+under `knowledge/<agent>/`, and use persona and stage contributions for the
+text that names the core default's services (the `azure` and `gcp` plugins add
+a short note before Step 1 of the stages that name AWS services). A plugin
+cannot open a slot, only fill one core opens, and two enabled plugins cannot
+fill the same slot: compile refuses both, and `aidlc config project --cloud`
+chooses among cloud plugins. See
+[Agent slots](../reference/18-plugin-mechanism.md#agent-slots).
+
 ### Engine upgrade lifecycle
 
 An engine reinstall copies the stock `dist/<harness>/` graph and core stage
@@ -750,7 +780,8 @@ test("plugin composes into a Claude install", () => {
   today (doc 18 §9 Status).
 - **Additive only.** Contributions add — they cannot override or remove a core
   stage's fields, agent, or prose. (A genuine need to _change_ upstream behavior
-  is a framework design decision, not a plugin concern.)
+  is a framework design decision, not a plugin concern.) A plugin agent takes a
+  stage seat only through an [agent slot](#fill-an-agent-slot) core opens.
 
 ## See also
 

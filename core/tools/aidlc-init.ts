@@ -133,7 +133,13 @@ import {
   _resetStageGraphForTests,
   activeSpace,
   activeWorkflowDescriptions,
+  type AgentMetadata,
+  cloudChoices,
+  cloudPlugins,
+  CLOUD_PLATFORM_SLOT,
+  CORE_CLOUD,
   DEFAULT_SPACE,
+  errorMessage,
   escapeRegex,
   fenceKeyBypassed,
   fileIdentity,
@@ -144,8 +150,10 @@ import {
   RECORDABLE_PROJECT_BYPASSES,
   type ProjectFlagsRecord,
   normalizeDriveLetter,
+  readAgents,
   resolveInvokingSessionId,
   sameFileIdentity,
+  selectedCloud,
   withAuditLock,
   writeFileAtomic,
 } from "./aidlc-lib.ts";
@@ -491,6 +499,7 @@ const CONFIG_VALUE_FLAGS = new Set([
   "--release-base-url",
   "--mark-done",
   "--plugins",
+  "--cloud",
   "--completions",
   "--reviewing-effort",
   "--save-as",
@@ -506,6 +515,7 @@ const CONFIG_VALUE_FLAGS = new Set([
 const CHOICE_VALUE_FLAGS = new Set([
   "--bypass",
   "--clear-bypass",
+  "--cloud",
   "--completions",
   "--default-scope",
   "--from",
@@ -3282,6 +3292,7 @@ function validateChoiceArgs(
         "--swarm",
       ])
     : new Set([
+        "--cloud",
         "--completions",
         "--from",
         "--harness",
@@ -3344,7 +3355,7 @@ function validateChoiceArgs(
         "--question-retention-days",
         "--swarm",
       ]
-    : ["--completions", "--mcp", "--plugins", "--reset"];
+    : ["--cloud", "--completions", "--mcp", "--plugins", "--reset"];
   return validateConfigMutationModes(argv, section, mutationFlags) ??
     (section === "flags" ? validateSettingsTargets(argv) : null);
 }
@@ -3376,6 +3387,7 @@ function choiceHelp(section: ChoiceSection): string {
     : [
         heading("Project choices:", out),
         "  --plugins <comma-separated-installed-names|all>",
+        "  --cloud <aws|installed cloud plugin>   the cloud the platform stages design for; turns that cloud plugin on and the others off",
         "  --mcp <defaults|none>",
         "  --completions <bash|zsh|fish|powershell|none>",
         "  --from <path>   release files to use instead of downloading: aidlc-copy-runtime-X.Y.Z.tar.gz, its runtime/ folder, or one harness root such as a checkout's dist/<harness>/",
@@ -3529,6 +3541,64 @@ function parsePluginAnswer(
   return names;
 }
 
+// The persona roster the project's own install carries.
+function projectAgents(harnessRoot: string): AgentMetadata[] {
+  const dir = join(harnessRoot, "agents");
+  return existsSync(dir) ? readAgents(dir) : [];
+}
+
+// `--cloud` is a plugin choice: the named cloud plugin on and every other
+// cloud plugin off, or every cloud plugin off for the core cloud. The plugin
+// selection stays the one record of it, and the choice makes it explicit, so a
+// cloud plugin installed later composes turned off instead of joining the one
+// chosen.
+function applyCloudAnswer(
+  value: string | undefined,
+  plugins: string[] | null,
+  known: readonly string[],
+  agents: () => readonly AgentMetadata[],
+): string[] | null {
+  if (value === undefined) return plugins;
+  const roster = agents();
+  const choices = cloudChoices(roster);
+  if (!choices.includes(value)) {
+    throw new Error(
+      `--cloud ${value}: this project offers ${choices.join(", ")}. ` +
+        "An installed cloud plugin joins the project at the next session start; " +
+        `if ${value} is installed and has not joined, choose one of these first, and it joins turned off.`,
+    );
+  }
+  const clouds = new Set(cloudPlugins(roster));
+  // No cloud plugin to turn off: the core cloud is already the one in use.
+  if (clouds.size === 0) return plugins;
+  const base = (plugins ?? [...known]).filter((name) => !clouds.has(name));
+  return [...new Set(value === CORE_CLOUD ? base : [...base, value])].sort();
+}
+
+// The cloud the selection runs on and the clouds on offer. When the cloud
+// cannot be told (more than one cloud plugin on, or an agent file that does
+// not parse), the cloud is null and the problem says why and what to do.
+function projectCloud(
+  harnessRoot: string,
+  plugins: string[] | null,
+): { cloud: string | null; choices: string[]; problem?: string } {
+  let agents: AgentMetadata[];
+  try {
+    agents = projectAgents(harnessRoot);
+  } catch (error) {
+    return { cloud: null, choices: [CORE_CLOUD], problem: errorMessage(error) };
+  }
+  const choices = cloudChoices(agents);
+  try {
+    return {
+      cloud: selectedCloud(agents, (plugin) => plugins === null || plugins.includes(plugin)),
+      choices,
+    };
+  } catch (error) {
+    return { cloud: null, choices, problem: errorMessage(error) };
+  }
+}
+
 function buildProjectRecord(
   current: ProjectChoicesRecord | null,
   currentPlugins: string[] | null,
@@ -3560,10 +3630,15 @@ function buildProjectRecord(
     dirname(selected.root),
     selected.harnessDir,
   );
-  const plugins = parsePluginAnswer(
-    valueAfter(argv, "--plugins"),
+  const plugins = applyCloudAnswer(
+    valueAfter(argv, "--cloud"),
+    parsePluginAnswer(
+      valueAfter(argv, "--plugins"),
+      known,
+      currentPlugins,
+    ),
     known,
-    currentPlugins,
+    () => projectAgents(selected.root),
   );
   return {
     record: normalizeProjectChoicesRecord(next) as ProjectChoicesRecord,
@@ -3623,11 +3698,15 @@ function showChoiceSection(
     };
   } else {
     const completion = records.project?.completions;
+    const { cloud, choices: cloudOptions, problem: cloudProblem } = projectCloud(selected.root, plugins);
     data = {
       section,
       harness: selected.harness,
       record: records.project,
       plugins,
+      cloud,
+      cloudChoices: cloudOptions,
+      ...(cloudProblem ? { cloudProblem } : {}),
       installedPlugins: discoverInstalledPluginNames(
         projectDir,
         selected.harnessDir,
@@ -3723,6 +3802,10 @@ function showChoiceSection(
     }
   } else {
     output += `  Plugins: ${plugins === null ? "all installed" : plugins.join(", ")}\n`;
+    const cloudOptions = data.cloudChoices as string[];
+    output += `  Cloud: ${
+      data.cloud ?? data.cloudProblem
+    }${data.cloud !== null && cloudOptions.length > 1 ? ` (choices: ${cloudOptions.join(", ")})` : ""}\n`;
     output += `  MCP consent: ${records.project?.mcp ?? "inherit"}\n`;
     if (data.mcpNote) output += `  MCP note: ${data.mcpNote}\n`;
     output += `  Completions: ${records.project?.completions ?? "not offered"}\n`;
@@ -3827,6 +3910,18 @@ function choiceWizard(
     `Enabled plugins [${known.join(",")}; all; Enter keep]:`,
   )?.trim();
   if (pluginAnswer) args.push("--plugins", pluginAnswer);
+  // The cloud is asked only when there is a choice; a roster that does not
+  // parse leaves the question out, and graph compile names the file.
+  let clouds: string[] = [CORE_CLOUD];
+  try {
+    clouds = cloudChoices(projectAgents(selected.root));
+  } catch {
+    // Keep the core cloud only.
+  }
+  if (clouds.length > 1) {
+    const cloud = configPrompt(`Cloud platform [${clouds.join("/")}, Enter keep]:`)?.trim();
+    if (cloud) args.push("--cloud", cloud);
+  }
   const currentMcp = records.project?.mcp ?? "none";
   const mcp = configPrompt(`MCP consent [defaults/none, Enter ${currentMcp}]:`)?.trim();
   if (mcp) args.push("--mcp", mcp);
@@ -3907,7 +4002,7 @@ function prepareChoiceSection(
         "--question-retention-days",
         "--swarm",
       ]
-    : ["--completions", "--mcp", "--plugins", "--reset"];
+    : ["--cloud", "--completions", "--mcp", "--plugins", "--reset"];
   const hasMutationFlags = mutationFlags.some((flag) => argv.includes(flag));
   if (
     (argv.includes("--show") || argv.includes("--check")) &&
@@ -4012,7 +4107,7 @@ function prepareChoiceSection(
     if (!configInputIsTty()) {
       const flags = section === "flags"
         ? "--default-scope, --swarm, --hook-debug, --sensor-timeout-ms, --question-retention-days, --bypass, or --reset"
-        : "--plugins, --mcp, --completions, or --reset";
+        : "--plugins, --cloud, --mcp, --completions, or --reset";
       emitResult(
         usage(
           `non-interactive ${section} configuration requires ${flags}; --yes confirms but never chooses`,
@@ -4829,7 +4924,23 @@ function removeListItems(content: string, field: string, items: readonly string[
   return content.replace(block, replacement);
 }
 
-function stripRecordedContributions(content: string, record: StageContribRecord): string {
+// Two plugins' records for one stage, as one: every list set-unioned.
+function mergeContribRecords(prior: StageContribRecord, record: StageContribRecord): StageContribRecord {
+  return {
+    produces: [...new Set([...(prior.produces ?? []), ...(record.produces ?? [])])],
+    sensors: [...new Set([...(prior.sensors ?? []), ...(record.sensors ?? [])])],
+    consumes: [...new Set([...(prior.consumes ?? []), ...(record.consumes ?? [])])],
+    requires_stage: [...new Set([...(prior.requires_stage ?? []), ...(record.requires_stage ?? [])])],
+    required_sections: [...new Set([...(prior.required_sections ?? []), ...(record.required_sections ?? [])])],
+    required_sections_created: prior.required_sections_created || record.required_sections_created,
+  };
+}
+
+function stripRecordedContributions(
+  content: string,
+  record: StageContribRecord,
+  which: (plugin: string) => boolean = () => true,
+): string {
   let value = content;
   for (const [field, items] of [
     ["produces", record.produces],
@@ -4856,13 +4967,14 @@ function stripRecordedContributions(content: string, record: StageContribRecord)
       value = value.replace(block[0], kept.length > 0 ? `consumes:\n${kept.join("")}` : "consumes: []\n");
     }
   }
-  return stripPluginFragments(value);
+  return stripPluginFragments(value, which);
 }
 
-function stripPluginFragments(content: string): string {
+function stripPluginFragments(content: string, which: (plugin: string) => boolean = () => true): string {
   const open = /<!-- plugin:([^:\n]+):([^\n]+?):(\d+):([0-9a-f]+) -->\n/g;
   let value = content;
   for (let match = open.exec(value); match; match = open.exec(value)) {
+    if (!which(match[1])) continue;
     const close = `<!-- /plugin:${match[1]}:${match[2]}:${match[3]}:${match[4]} -->`;
     const closeAt = value.indexOf(close, match.index);
     if (closeAt < 0) continue;
@@ -4870,6 +4982,11 @@ function stripPluginFragments(content: string): string {
     open.lastIndex = Math.max(0, match.index - 2);
   }
   return value;
+}
+
+// The plugin a fragment's open marker names.
+function fragmentPlugin(marker: string): string {
+  return /^<!-- plugin:([^:\n]+):/.exec(marker)?.[1] ?? "";
 }
 
 function pluginFragments(content: string): Array<{ marker: string; anchor: string; block: string }> {
@@ -6846,25 +6963,40 @@ function prepareRefreshSource(
     }
   }
 
+  // The plugins the refreshed project runs with: a project choice's new
+  // selection, else the one it has (null: every installed plugin). A plugin
+  // that is off keeps none of its merged contributions, as select-plugins
+  // strips them, so they are not replayed and its record goes.
+  let targetPlugins: string[] | null = null;
+  if (diagnosticsOverride && Object.hasOwn(diagnosticsOverride, "plugins")) {
+    targetPlugins = diagnosticsOverride.plugins ?? null;
+  } else if (regularFile(currentHarnessData)) {
+    try {
+      targetPlugins = readPluginSelection(currentHarness);
+    } catch {
+      // An unreadable selection keeps every contribution, as before.
+    }
+  }
+  const sidecarKey = (plugin: string) => plugin.replace(/[^\w.-]/g, "_");
+  const pluginOn = (plugin: string) =>
+    targetPlugins === null || targetPlugins.some((name) => sidecarKey(name) === sidecarKey(plugin));
+  const offSidecars: string[] = [];
+  // Every recorded contribution, to tell a file changed only by plugins; and
+  // the ones of plugins still on, to replay.
   const records = new Map<string, StageContribRecord>();
+  const keptRecords = new Map<string, StageContribRecord>();
+  const offRecords = new Map<string, StageContribRecord>();
   const dataDir = join(currentHarness, "tools", "data");
   if (pathPresent(dataDir) && lstatSync(dataDir).isDirectory()) {
     for (const file of readdirSync(dataDir).filter((name) => /^plugin-contrib-.+\.json$/.test(name))) {
       if (!regularFile(join(dataDir, file))) continue;
       const parsed = JSON.parse(readFileSync(join(dataDir, file), "utf-8")) as Record<string, StageContribRecord>;
+      const on = pluginOn(file.slice("plugin-contrib-".length, -".json".length));
+      if (!on) offSidecars.push(`${descriptor.harnessDir}/tools/data/${file}`);
       for (const [slug, record] of Object.entries(parsed)) {
-        const priorRecord = records.get(slug) ?? {};
-        records.set(slug, {
-          produces: [...new Set([...(priorRecord.produces ?? []), ...(record.produces ?? [])])],
-          sensors: [...new Set([...(priorRecord.sensors ?? []), ...(record.sensors ?? [])])],
-          consumes: [...new Set([...(priorRecord.consumes ?? []), ...(record.consumes ?? [])])],
-          requires_stage: [...new Set([...(priorRecord.requires_stage ?? []), ...(record.requires_stage ?? [])])],
-          required_sections: [
-            ...new Set([...(priorRecord.required_sections ?? []), ...(record.required_sections ?? [])]),
-          ],
-          required_sections_created:
-            priorRecord.required_sections_created || record.required_sections_created,
-        });
+        const byState = on ? keptRecords : offRecords;
+        byState.set(slug, mergeContribRecords(byState.get(slug) ?? {}, record));
+        records.set(slug, mergeContribRecords(records.get(slug) ?? {}, record));
       }
     }
   }
@@ -6910,7 +7042,9 @@ function prepareRefreshSource(
     // Read as AI-DLC wrote it: a CRLF checkout is the same file.
     const current = readFileSync(currentPath, "utf-8").replaceAll("\r\n", "\n");
     const record = records.get(slug) ?? {};
+    const kept = keptRecords.get(slug) ?? {};
     const fragments = pluginFragments(current);
+    const keptFragments = fragments.filter((fragment) => pluginOn(fragmentPlugin(fragment.marker)));
     const hasRecordedContribution = Object.entries(record).some(([key, value]) =>
       key === "required_sections_created" ? value === true : Array.isArray(value) && value.length > 0
     );
@@ -6921,39 +7055,56 @@ function prepareRefreshSource(
     const strippedHash = sha256Bytes(stripRecordedContributions(current, record));
     if (priorHash && currentHash !== priorHash && strippedHash !== priorHash) continue;
     let fresh = readFileSync(stagedPath, "utf-8");
+    // A file staged from the project's own copy holds every plugin's
+    // contributions, so a plugin turned off leaves with its own. A release
+    // file holds none, and a value it declares itself stays core's.
+    const off = (plugin: string) => !pluginOn(plugin);
+    if (rel.endsWith(".toml")) {
+      fresh = editTomlInstructions(fresh, (body) => stripPluginFragments(body, off)) ?? fresh;
+    } else {
+      fresh = projectProjection || projectOverlays.has(rel)
+        ? stripRecordedContributions(fresh, offRecords.get(slug) ?? {}, off)
+        : stripPluginFragments(fresh, off);
+    }
     // A stage carried over from the project (a plugin stage) is not core's,
     // so its edges are not core-owned, and it already holds the recorded
     // edges: a stale one has to be removed rather than just not re-added.
     const coreEdges = new Set(projectOverlays.has(rel) ? [] : listFieldItems(fresh, "requires_stage"));
-    const pluginEdges = (record.requires_stage ?? []).filter((dependency) => !coreEdges.has(dependency));
+    const pluginEdges = (kept.requires_stage ?? []).filter((dependency) => !coreEdges.has(dependency));
     const replayedEdges = pluginEdges.filter((dependency) => requiresEdgeHolds(slug, dependency));
     const staleEdges = pluginEdges.filter((dependency) => !replayedEdges.includes(dependency));
-    const retired = (record.requires_stage ?? []).filter((dependency) => !replayedEdges.includes(dependency));
+    const retired = (kept.requires_stage ?? []).filter((dependency) => !replayedEdges.includes(dependency));
     if (retired.length > 0) retiredEdges.set(slug, new Set(retired));
-    fresh = mergeListField(fresh, "produces", record.produces ?? []);
-    fresh = mergeListField(fresh, "sensors", record.sensors ?? []);
+    fresh = mergeListField(fresh, "produces", kept.produces ?? []);
+    fresh = mergeListField(fresh, "sensors", kept.sensors ?? []);
     fresh = removeListItems(fresh, "requires_stage", staleEdges);
     fresh = mergeListField(fresh, "requires_stage", replayedEdges);
     fresh = mergeConsumes(
       fresh,
       consumeBlocks(
         current,
-        new Set((record.consumes ?? []).map((entry) => typeof entry === "string" ? entry : entry.artifact)),
+        new Set((kept.consumes ?? []).map((entry) => typeof entry === "string" ? entry : entry.artifact)),
       ),
     );
-    fresh = mergeRequiredSections(fresh, record);
+    fresh = mergeRequiredSections(fresh, kept);
     if (rel.endsWith(".toml")) {
       // A Codex twin: its fragments live inside the developer_instructions string.
-      const merged = editTomlInstructions(fresh, (body) => mergePluginFragments(body, fragments));
+      const merged = editTomlInstructions(fresh, (body) => mergePluginFragments(body, keptFragments));
       if (merged === null) throw new Error(`cannot reapply plugin fragments: ${rel} has no developer_instructions string`);
       fresh = merged;
     } else {
-      fresh = mergePluginFragments(fresh, fragments);
+      fresh = mergePluginFragments(fresh, keptFragments);
     }
     writeFileSync(stagedPath, fresh);
     if (prior) regenerated.add(rel);
   }
   const emptiedSidecars = new Set<string>();
+  // A plugin turned off loses its record along with its contributions.
+  for (const rel of offSidecars) {
+    if (regularFile(join(root, rel))) rmSync(join(root, rel));
+    regenerated.delete(rel);
+    emptiedSidecars.add(rel);
+  }
   if (retiredEdges.size > 0 && pathPresent(dataDir) && lstatSync(dataDir).isDirectory()) {
     for (const file of readdirSync(dataDir).filter((name) => /^plugin-contrib-.+\.json$/.test(name))) {
       const rel = `${descriptor.harnessDir}/tools/data/${file}`;
@@ -7049,18 +7200,27 @@ function prepareRefreshSource(
     // The generated tables live beside the skill, out of its body.
     const tablesPath = join(dirname(skillPath), "tables.md");
     if (existsSync(tablesPath)) {
-      let generated = readFileSync(tablesPath, "utf-8");
-      generated = replaceGeneratedRegion(
-        generated,
-        canonicalStageTableRegion(renderStageTable()),
-        "stage",
-      );
-      generated = replaceGeneratedRegion(
-        generated,
-        canonicalScopeTableRegion(renderScopeTable()),
-        "scope",
-      );
+      const stageRegion = canonicalStageTableRegion(renderStageTable());
+      const scopeRegion = canonicalScopeTableRegion(renderScopeTable());
+      const regenerate = (text: string): string =>
+        replaceGeneratedRegion(replaceGeneratedRegion(text, stageRegion, "stage"), scopeRegion, "scope");
+      const generated = regenerate(readFileSync(tablesPath, "utf-8"));
       writeFileSync(tablesPath, generated);
+      // A plugin compose or selection rewrites the project's tables from its
+      // graph. A project copy that differs from the staged one only inside the
+      // tables is that output, not a local change; text edited outside them
+      // still is.
+      const tablesRel = relative(root, tablesPath).replaceAll("\\", "/");
+      const current = join(projectDir, tablesRel);
+      if (regularFile(current)) {
+        try {
+          // A CRLF checkout is the same file.
+          const lf = (text: string) => text.replaceAll("\r\n", "\n");
+          if (lf(regenerate(readFileSync(current, "utf-8"))) === lf(generated)) regenerated.add(tablesRel);
+        } catch {
+          // A project copy without both table regions is a local change.
+        }
+      }
     }
     regenerated.add(`${descriptor.harnessDir}/tools/data/stage-graph.json`);
     for (const directory of skillsDirs) {
@@ -11711,10 +11871,37 @@ function projectChangeLines(projectDir: string, context: ChoicesMutationContext)
       undo = earlier ? [...undo, flag, earlier] : null;
     }
   }
-  if (!undo || !printableArgs(undo)) return [`Changed the project choices in ${file}.`];
-  return [`Changed the project choices in ${file}. To undo: ${configInvocationFor(projectDir)} config project ${
-    undo.map((arg) => quoteCommandArgument(arg)).join(" ")
-  } --yes${namedHarness(projectDir, context.distribution)}${projectTarget(projectDir)}`];
+  const lines = !undo || !printableArgs(undo)
+    ? [`Changed the project choices in ${file}.`]
+    : [`Changed the project choices in ${file}. To undo: ${configInvocationFor(projectDir)} config project ${
+      undo.map((arg) => quoteCommandArgument(arg)).join(" ")
+    } --yes${namedHarness(projectDir, context.distribution)}${projectTarget(projectDir)}`];
+  if (pluginsChanged && context.previousPlugins === null && context.nextPlugins !== null) {
+    lines.push("Plugins are now chosen by name, so a plugin installed later is added turned off until you turn it on.");
+  }
+  if (pluginsChanged) lines.push(...cloudSwitchLines(projectDir, context));
+  return lines;
+}
+
+// A cloud switch while work is open is said once: the open work's platform
+// stages run with the new cloud's agent, and a stage already finished keeps
+// what the earlier one produced.
+function cloudSwitchLines(projectDir: string, context: ChoicesMutationContext): string[] {
+  const root = join(projectDir, context.harnessDir);
+  const before = projectCloud(root, context.previousPlugins).cloud;
+  const after = projectCloud(root, context.nextPlugins).cloud;
+  if (before === null || after === null || before === after) return [];
+  const open = activeWorkflowDescriptions(projectDir);
+  if (open.length === 0) return [];
+  const agents = projectAgents(root);
+  const agentName = (cloud: string): string =>
+    agents.find((agent) =>
+      agent.slot === CLOUD_PLATFORM_SLOT && (agent.plugin ?? CORE_CLOUD) === cloud
+    )?.display_name ?? `${cloud} platform agent`;
+  return [
+    `The platform stages of your open work (${open.join(", ")}) now run with the ${agentName(after)}; ` +
+      `a stage already finished keeps what the ${agentName(before)} produced.`,
+  ];
 }
 
 // The machine settings file lives outside the project, so its change runs as
