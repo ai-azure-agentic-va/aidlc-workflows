@@ -952,10 +952,32 @@ and the shell-completion answer:
 ```bash
 aidlc config project --plugins aidlc,test-pro --mcp none \
   --completions zsh --yes
+aidlc config project --cloud azure --yes
 aidlc config project --show --json
 aidlc config project --check
 aidlc config project --reset --yes
 ```
+
+`--cloud` chooses the cloud the platform stages design for: `aws` (the core
+AWS Platform Agent, the default) or an installed cloud plugin, such as
+`azure` or `gcp`. It turns that cloud plugin on and every other cloud plugin
+off, so it is a plugin choice and is recorded in the same `plugins` selection;
+`--show` reports the cloud in use and the choices. The selection it writes
+names each plugin, so any plugin installed later is added turned off until you
+turn it on with `--plugins`; the command says so the first time. Switching
+removes the earlier cloud's notes from the stages and agents at once, and the
+new cloud plugin adds its own at the next session start (or `/aidlc plugin
+sync`). When work is open, the command says which agent its platform stages
+now run with. Install a cloud plugin through your host first, the way any
+plugin is installed (see
+[Authoring a Plugin](../harness-engineering/10-authoring-a-plugin.md#5-distribution--install));
+`--cloud` refuses a cloud the project does not have yet and lists the ones it
+does. Run interactively, `aidlc config project` asks for the cloud when at
+least one cloud plugin is installed.
+
+A plugin turned off with `--plugins` or `--cloud` loses what it merged into
+core stages and agents, as `/aidlc plugin select` strips it; turning it on
+again restores it at the next session start.
 
 On a copy-channel projection, `config project` applies plugin, MCP, and
 completion choices from the project's own files at the release it already

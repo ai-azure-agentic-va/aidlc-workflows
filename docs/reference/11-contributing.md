@@ -436,7 +436,7 @@ A stage is authored as a Markdown file with YAML frontmatter under `core/aidlc-c
 
 ## Adding an Agent
 
-Agent metadata (display name, example knowledge files) is read from each agent's `.md` frontmatter under `core/agents/`. The `loadAgents()` helper in `core/tools/aidlc-lib.ts` discovers every persona `.md` file in that directory (one named `aidlc-*` or carrying `display_name`, `examples`, `tier`, or `plugin`) and derives the metadata map consumed by the statusline hook (to render the display name). Adding an agent requires no TypeScript edits.
+Agent metadata (display name, example knowledge files) is read from each agent's `.md` frontmatter under `core/agents/`. The `loadAgents()` helper in `core/tools/aidlc-lib.ts` discovers every persona `.md` file in that directory (one named `aidlc-*` or carrying `display_name`, `examples`, `tier`, or `plugin`) and derives the metadata map consumed by the statusline hook (to render the display name). Adding an agent requires no TypeScript edits. An optional `slot:` key opens an agent slot that one plugin persona may fill (see [Agent Slots](05-agent-system.md#agent-slots)); only `aidlc-aws-platform-agent` opens one today.
 
 ### Steps
 

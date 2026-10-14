@@ -274,6 +274,7 @@ import {
   workToPickUp,
   readProjectDescriptionAuthority,
   LEGACY_PLAN_APPROVAL_RECOVERY_CHOICE,
+  loadAgents,
   loadScopeMetadata,
   maximalAttemptEvents,
   resolveReviewClass,
@@ -2668,9 +2669,21 @@ const TRADE_BY_ROLE: Readonly<Record<string, string>> = {
 
 function roleInWords(agent: string): string {
   const match = /^aidlc-(.+)-agent$/.exec(agent.trim());
-  if (!match) return "";
+  if (!match) return slotRoleInWords(agent.trim());
   const fragment = match[1].replaceAll("-", " ");
   return TRADE_BY_ROLE[fragment] ?? fragment;
+}
+
+// A plugin persona holding a seat a core persona opens is that seat's trade.
+function slotRoleInWords(agent: string): string {
+  try {
+    const agents = loadAgents();
+    const slot = agents.find((candidate) => candidate.slug === agent)?.slot;
+    const opener = agents.find((candidate) => candidate.slot === slot && candidate.plugin === undefined);
+    return slot !== undefined && opener ? roleInWords(opener.slug) : "";
+  } catch {
+    return "";
+  }
 }
 
 // Record that the engine was ADVANCED this turn, for the Stop hook's

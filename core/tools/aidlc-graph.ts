@@ -94,6 +94,7 @@ import {
   memoryGuardPolicyDeclarations,
   noteGuardPolicyRename,
   parseGuardPolicy,
+  resolveAgentSlots,
   resolveProjectDir,
   resolveProjectFlag,
   resolveWorkflowSelection,
@@ -2437,6 +2438,22 @@ function applyPluginSelection(stages: GraphStage[]): void {
   }
 }
 
+// A stage names a slot's core default; when an enabled plugin fills the slot,
+// the compiled stage names the filler instead (resolveAgentSlots). Stage
+// source stays as authored, so a recompile without the plugin restores it.
+function applyAgentSlots(stages: GraphStage[]): void {
+  const filled = new Map(
+    resolveAgentSlots()
+      .filter((s) => s.agent !== s.defaultAgent)
+      .map((s) => [s.defaultAgent, s.agent]),
+  );
+  if (filled.size === 0) return;
+  for (const stage of stages) {
+    stage.lead_agent = filled.get(stage.lead_agent) ?? stage.lead_agent;
+    stage.support_agents = stage.support_agents.map((a) => filled.get(a) ?? a);
+  }
+}
+
 function validateSelectionClosure(stages: GraphStage[]): void {
   const producersByArtifact = new Map<string, GraphStage[]>();
   for (const stage of stages) {
@@ -2790,6 +2807,7 @@ export function compileStageGraph(): {
   }
 
   applyPluginSelection(stages);
+  applyAgentSlots(stages);
   validateSelectionClosure(stages);
 
   // Edge-local invariant: for every edge A in B.requires_stage,
