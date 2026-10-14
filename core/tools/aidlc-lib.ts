@@ -38170,6 +38170,11 @@ export interface AgentMetadata {
   slug: string;
   display_name: string;
   examples: string[];
+  // The plugin that ships the persona; absent for core.
+  plugin?: string;
+  // The agent slot the persona opens (core) or fills (plugin); see
+  // resolveAgentSlots.
+  slot?: string;
 }
 
 // .claude/agents/ holds one <slug>.md per persona. AIDLC_AGENTS_DIR env-var
@@ -38223,29 +38228,32 @@ export function foreignAgentFiles(dir: string = agentsDir()): string[] {
 }
 
 export function loadAgents(): AgentMetadata[] {
-  if (!_agents) {
-    const dir = agentsDir();
-    const slugToFile = new Map<string, string>();
-    const agents: AgentMetadata[] = [];
-    const files = readdirSync(dir)
-      .filter((f) => f.endsWith(".md") && !isKiroConductorAgentFile(f))
-      .sort();
-    for (const f of files) {
-      const filePath = join(dir, f);
-      if (!isAidlcAgentFile(filePath)) continue;
-      const agent = parseAgentFrontmatter(filePath);
-      const previousFile = slugToFile.get(agent.slug);
-      if (previousFile) {
-        throw new Error(
-          `Duplicate agent slug "${agent.slug}" in ${filePath}: already declared in ${previousFile}. Rename one of them.`
-        );
-      }
-      slugToFile.set(agent.slug, filePath);
-      agents.push(agent);
-    }
-    _agents = agents.sort((a, b) => a.slug.localeCompare(b.slug));
-  }
+  if (!_agents) _agents = readAgents(agentsDir());
   return _agents;
+}
+
+// The persona roster of one agents directory, uncached: config commands read
+// a project's roster from outside the engine that serves it.
+export function readAgents(dir: string): AgentMetadata[] {
+  const slugToFile = new Map<string, string>();
+  const agents: AgentMetadata[] = [];
+  const files = readdirSync(dir)
+    .filter((f) => f.endsWith(".md") && !isKiroConductorAgentFile(f))
+    .sort();
+  for (const f of files) {
+    const filePath = join(dir, f);
+    if (!isAidlcAgentFile(filePath)) continue;
+    const agent = parseAgentFrontmatter(filePath);
+    const previousFile = slugToFile.get(agent.slug);
+    if (previousFile) {
+      throw new Error(
+        `Duplicate agent slug "${agent.slug}" in ${filePath}: already declared in ${previousFile}. Rename one of them.`
+      );
+    }
+    slugToFile.set(agent.slug, filePath);
+    agents.push(agent);
+  }
+  return agents.sort((a, b) => a.slug.localeCompare(b.slug));
 }
 
 export function _resetAgentsForTests(): void {
@@ -38271,7 +38279,119 @@ function parseAgentFrontmatter(path: string): AgentMetadata {
       `Agent file ${path} missing required frontmatter: ${missing.join(", ")}${because}`
     );
   }
-  return { slug, display_name, examples };
+  const agent: AgentMetadata = { slug, display_name, examples };
+  const plugin = scalarField(fm, "plugin");
+  if (plugin) agent.plugin = plugin;
+  const slot = scalarField(fm, "slot");
+  if (slot) {
+    if (!/^[a-z][a-z0-9-]*$/.test(slot)) {
+      throw new Error(
+        `Agent file ${path} has slot "${slot}"; a slot name is lowercase letters, digits, and dashes.`
+      );
+    }
+    agent.slot = slot;
+  }
+  return agent;
+}
+
+// The slot the platform persona holds. `config project --cloud` names its
+// holder by plugin, and the core default by CORE_CLOUD.
+export const CLOUD_PLATFORM_SLOT = "cloud-platform";
+export const CORE_CLOUD = "aws";
+
+/** The clouds a roster offers: the core default, then each plugin whose
+ *  persona fills the cloud-platform slot, whether it is turned on or not. */
+export function cloudChoices(agents: readonly AgentMetadata[]): string[] {
+  return [CORE_CLOUD, ...cloudPlugins(agents).filter((plugin) => plugin !== CORE_CLOUD)];
+}
+
+/** Every plugin whose persona fills the cloud-platform slot. A plugin named
+ *  like the core cloud is one of them but never a choice, so choosing any
+ *  cloud turns it off. */
+export function cloudPlugins(agents: readonly AgentMetadata[]): string[] {
+  const plugins = agents
+    .filter((a) => a.slot === CLOUD_PLATFORM_SLOT && a.plugin !== undefined)
+    .map((a) => a.plugin!);
+  return [...new Set(plugins)].sort();
+}
+
+/** The cloud a selection runs on: the plugin holding the cloud-platform
+ *  slot, or the core default. Throws as resolveAgentSlots does when more
+ *  than one cloud plugin is turned on. */
+export function selectedCloud(
+  agents: readonly AgentMetadata[],
+  enabled: (plugin: string) => boolean,
+): string {
+  const slot = resolveAgentSlots(agents, enabled).find((s) => s.slot === CLOUD_PLATFORM_SLOT);
+  return slot?.plugin ?? CORE_CLOUD;
+}
+
+/** One agent slot after the plugin selection: the core persona that opens it,
+ *  the persona that holds it, and the plugin that persona comes from (null
+ *  when the core default holds it). */
+export interface AgentSlot {
+  slot: string;
+  defaultAgent: string;
+  agent: string;
+  plugin: string | null;
+}
+
+/** An agent slot is a seat a core persona holds by default and one enabled
+ *  plugin persona may take: a core agent opens it with `slot: <name>`, and a
+ *  plugin agent that declares the same `slot:` fills it. Graph compile runs
+ *  every stage that names the default with the filler instead, so turning the
+ *  plugin off compiles back to the default. Only core opens a slot, so a
+ *  plugin can take a seat core offers and never replace any other agent. */
+export function resolveAgentSlots(
+  agents: readonly AgentMetadata[] = loadAgents(),
+  enabled: (plugin: string) => boolean = isPluginEnabled,
+): AgentSlot[] {
+  const defaults = new Map<string, AgentMetadata>();
+  const fillers = new Map<string, AgentMetadata[]>();
+  for (const agent of agents) {
+    if (agent.slot === undefined) continue;
+    if (agent.plugin === undefined) {
+      const previous = defaults.get(agent.slot);
+      if (previous) {
+        throw new Error(
+          `Agents ${previous.slug} and ${agent.slug} both open the slot "${agent.slot}". ` +
+            "Only one core agent may open a slot."
+        );
+      }
+      defaults.set(agent.slot, agent);
+    } else if (enabled(agent.plugin)) {
+      fillers.set(agent.slot, [...(fillers.get(agent.slot) ?? []), agent]);
+    }
+  }
+  for (const [slot, list] of fillers) {
+    if (!defaults.has(slot)) {
+      throw new Error(
+        `Agent ${list[0].slug} from plugin ${list[0].plugin} fills the slot "${slot}", ` +
+          "which no core agent opens. A plugin agent can only fill a slot a core agent opens."
+      );
+    }
+    if (list.length > 1) {
+      const named = list.map((a) => `${a.plugin} (${a.slug})`).sort().join(", ");
+      throw new Error(
+        slot === CLOUD_PLATFORM_SLOT
+          ? `More than one cloud plugin is turned on: ${named}. ` +
+              `Choose one with \`${aidlcInvocation()} config project --cloud <name>\`.`
+          : `More than one plugin that is turned on fills the slot "${slot}": ${named}. ` +
+              `Turn on only one of them with \`${aidlcInvocation()} config project --plugins <names>\`.`
+      );
+    }
+  }
+  return [...defaults.values()]
+    .map((def) => {
+      const filler = fillers.get(def.slot!)?.[0];
+      return {
+        slot: def.slot!,
+        defaultAgent: def.slug,
+        agent: filler?.slug ?? def.slug,
+        plugin: filler?.plugin ?? null,
+      };
+    })
+    .sort((a, b) => a.slot.localeCompare(b.slot));
 }
 
 export function frontmatterBlock(body: string): string | null {

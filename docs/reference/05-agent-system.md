@@ -39,6 +39,27 @@ tier: judgment
 | `tools` | No | Optional allowlist; omit to inherit the full session toolset. Listing it narrows the agent and drops inherited MCP tools unless `mcp__<server>__<tool>` ids are also listed |
 | `disallowedTools` | Yes in authored core | Must include `Task` -- only the conductor delegates. The packager removes or translates this Claude-dialect key when a harness uses a different native tool-policy surface |
 | `tier` | Yes | `judgment`, `balanced`, or `templated`. The AUTHORED dial: the packager projects it into each harness's native model/effort keys (see Agent Tiers below). Raw `model:`/`effort:` never appear in authored frontmatter -- they are projection OUTPUTS in the ignored local `dist/<harness>/` tree and versioned release runtime. |
+| `slot` | No | The agent slot the persona opens. Only `aidlc-aws-platform-agent` carries one: `slot: cloud-platform`. See Agent Slots below |
+
+### Agent Slots
+
+An agent slot is a seat a core persona holds by default and one enabled plugin
+persona may take. A core agent opens the slot with `slot: <name>`; a plugin
+agent that declares the same `slot:` fills it. Graph compile
+(`resolveAgentSlots` in `core/tools/aidlc-lib.ts`, applied by
+`compileStageGraph`) then names the filler on every stage that names the core
+default, as `lead_agent` and in `support_agents`. Stage source is never edited,
+so turning the plugin off and recompiling gives the stages back to the core
+persona. The compile refuses a plugin that fills a slot no core agent opens,
+and more than one enabled plugin filling the same slot, naming each plugin and
+the command that chooses one.
+
+Core opens one slot today: `cloud-platform`, held by `aidlc-aws-platform-agent`
+on the seven platform stages (Feasibility, Domain Design, Contract Design, NFR
+Design, Infrastructure Design, Environment Provisioning, and Feedback &
+Optimization). The first-party `azure` and `gcp` plugins fill it, and
+`aidlc config project --cloud <aws|azure|gcp>` chooses which one is on (see
+[The Plugin Mechanism](18-plugin-mechanism.md#agent-slots)).
 
 Kiro IDE projects this core contract differently: it removes
 `disallowedTools`, adds `tools: ["read", "write", "shell"]`, and adds

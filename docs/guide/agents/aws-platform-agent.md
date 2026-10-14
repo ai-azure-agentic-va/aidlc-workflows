@@ -38,3 +38,14 @@ The aidlc-aws-platform-agent receives application topology from the aidlc-archit
 - Cost is a first-class architectural concern — every design includes a cost estimate
 - IAM policies grant minimum permissions required — no wildcard policies
 - Dev, staging, and production must differ only in scale, never in topology
+
+## On Azure or Google Cloud
+
+This agent is the default holder of the cloud-platform seat. When a project
+runs on Microsoft Azure or Google Cloud, install the `azure` or `gcp` plugin
+and choose it with `aidlc config project --cloud azure` (or `gcp`). The
+plugin's agent (`azure-platform-agent` or `gcp-platform-agent`) then leads and
+supports the same seven stages, with that cloud's Well-Architected review,
+infrastructure-as-code practice (Bicep, or Terraform on Google Cloud), and cost
+patterns. `aidlc config project --cloud aws` gives the stages back to this
+agent. See [Project Choices](../18-install-and-lifecycle.md#project-choices).

@@ -10,6 +10,7 @@ description: >
   Supports Feasibility, Domain Design, Contract Design, NFR Design, and Feedback & Optimization.
 disallowedTools: Task
 tier: judgment
+slot: cloud-platform
 ---
 
 # AWS Platform Agent

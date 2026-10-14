@@ -137,6 +137,7 @@ The aidlc-aws-platform-agent designs infrastructure, provisions environments, an
 - **Leads:** infrastructure-design, environment-provisioning
 - **Supports:** feasibility, domain-design, contract-design, nfr-design, feedback-optimization
 - **Special tools:** Bash (for `aws`, `cdk` commands)
+- **On Azure or Google Cloud:** the `azure` and `gcp` plugins each ship a platform agent (`azure-platform-agent`, `gcp-platform-agent`) that takes this seat on the same stages. Choose the cloud with `aidlc config project --cloud <aws|azure|gcp>` ([Project Choices](18-install-and-lifecycle.md#project-choices))
 
 ### [aidlc-compliance-agent](agents/compliance-agent.md)
 
