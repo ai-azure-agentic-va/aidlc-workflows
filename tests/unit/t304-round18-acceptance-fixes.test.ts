@@ -537,7 +537,7 @@ describe("t304 copied projection configuration", () => {
       `error: .claude no longer has the MCP server list for ${AIDLC_VERSION}\n`,
     );
     expect(back.stdout).toContain(
-      `offline: get https://github.com/awslabs/aidlc-workflows/releases/download/v${AIDLC_VERSION}/aidlc-copy-runtime-${AIDLC_VERSION}.tar.gz and its .sha256 into one folder, then add --from <that file>`,
+      `offline: get https://github.com/ai-azure-agentic-va/aidlc-workflows/releases/download/v${AIDLC_VERSION}/aidlc-copy-runtime-${AIDLC_VERSION}.tar.gz and its .sha256 into one folder, then add --from <that file>`,
     );
     expect(fixLine(back.stdout)).toBe(
       "bun .claude/tools/aidlc.ts config project --mcp defaults --yes --download",
