@@ -141,6 +141,9 @@ if [ "$(id -u)" -eq 0 ]; then
   [ -n "${HOME:-}" ] ||
     fail 4 failed "refusing a root install with HOME unset; set HOME to root's home directory"
   # -L follows a symlinked home, so the owner checked is the real directory's.
+  # -d lists the home itself and -n prints numeric ids; the owner column comes
+  # before the name, so no file name is parsed.
+  # shellcheck disable=SC2012
   home_uid=$(ls -ldnL "$HOME" 2>/dev/null | awk '{print $3}')
   [ "$home_uid" = 0 ] ||
     fail 4 failed "refusing a root install into a home directory not owned by root: $HOME"
