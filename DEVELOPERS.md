@@ -167,7 +167,12 @@ The workflow:
 4. Publishes a GitHub **prerelease** for preview users after the gates pass.
    Preview publication leaves stable release discovery unchanged.
 
-A failing Full Suite does not stop steps 3 and 4. The **Release tests** job
+A failing Full Suite does not stop steps 3 and 4. **Run workflow** also offers
+**Run the Full Suite first** (on by default). Switched off, step 2 does not
+run, so a fork without the `ai-pr-review` Bedrock role can publish a preview
+without waiting hours for a suite whose live jobs cannot pass; the preview's
+notes open with a warning that no test result backs it. The nightly schedule
+always runs the Full Suite. The **Release tests** job
 summary and the `preview-test-report` artifact list the failed legs, failed
 jobs, and failing test cases. The published preview's notes open with a warning
 and end with the same report. Full Suite retains its failed status in its own

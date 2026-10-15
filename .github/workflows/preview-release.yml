@@ -2,6 +2,11 @@ name: Preview Release
 
 on:
   workflow_dispatch:
+    inputs:
+      full_suite:
+        description: "Run the Full Suite first. Its live jobs need the ai-pr-review environment's Bedrock role; switched off, the preview publishes untested and its notes say so."
+        type: boolean
+        default: true
   schedule:
     - cron: "0 22 * * *"
       timezone: "Europe/Lisbon"
@@ -91,6 +96,8 @@ jobs:
 
   full_suite:
     needs: [validate, gate]
+    # A manual run can switch the Full Suite off; a scheduled run always runs it.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.full_suite }}
     runs-on: ubuntu-latest
     continue-on-error: true
     permissions:
@@ -136,10 +143,10 @@ jobs:
     steps:
       - name: Require a finished Full Suite
         env:
-          FULL_SUITE_RESULT: ${{ needs.full_suite.outputs.result || 'failure' }}
+          FULL_SUITE_RESULT: ${{ (github.event_name == 'workflow_dispatch' && !inputs.full_suite) && 'off' || needs.full_suite.outputs.result || 'failure' }}
         run: |
           case "$FULL_SUITE_RESULT" in
-            success | failure) ;;
+            success | failure | off) ;;
             *) echo "::error::Full Suite did not finish: $FULL_SUITE_RESULT"; exit 1 ;;
           esac
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -171,7 +178,7 @@ jobs:
           }
       - name: Report Full Suite results
         env:
-          FULL_SUITE_RESULT: ${{ needs.full_suite.outputs.result || 'failure' }}
+          FULL_SUITE_RESULT: ${{ (github.event_name == 'workflow_dispatch' && !inputs.full_suite) && 'off' || needs.full_suite.outputs.result || 'failure' }}
           FULL_SUITE_RUN_ID: ${{ needs.full_suite.outputs.run_id }}
           SOURCE_SHA: ${{ needs.validate.outputs.sha }}
         run: |
@@ -796,7 +803,7 @@ jobs:
       # release limit.
       - name: Stage preview notes
         env:
-          FULL_SUITE_RESULT: ${{ needs.full_suite.outputs.result || 'failure' }}
+          FULL_SUITE_RESULT: ${{ (github.event_name == 'workflow_dispatch' && !inputs.full_suite) && 'off' || needs.full_suite.outputs.result || 'failure' }}
           PREVIEW_PLAN: ${{ needs.validate.outputs.preview_plan }}
           UPDATE_RESULT: ${{ needs.update-from-previous.result }}
         run: |

@@ -22,12 +22,17 @@ export const FAILED_SUITE_WARNING =
   "> **Warning:** Full Suite failed for this source. A Full Suite failure report ends these notes.\n\n";
 export const FAILED_SUITE_POINTER =
   "> **Warning:** Full Suite failed for this source. The preview run has the failure report.\n\n";
+// A manual preview started with the Full Suite switched off ran no tests.
+export const OFF_SUITE_WARNING =
+  "> **Warning:** Full Suite did not run for this source: this preview was started with it switched off, so no test result backs it.\n\n";
 export const FAILED_UPDATE_WARNING =
   "> **Warning:** Updating from the last release to this preview failed in its checks. Stay on your release or wait for the next preview.\n\n";
 const TRUNCATED_NOTES = "\n- ...report truncated; the run summary has the full report.\n";
 
 export interface PreviewFailures {
   suite: boolean;
+  /** The suite was switched off for this preview, so it has no result. */
+  suiteOff?: boolean;
   /** The preview run, when the update from the last release failed in it. */
   updateRunUrl?: string;
 }
@@ -166,6 +171,10 @@ export function renderReport(options: {
     lines.push(`Full Suite **passed** for ${source} in ${run}.`);
     return `${lines.join("\n")}\n`;
   }
+  if (options.fullSuiteResult === "off") {
+    lines.push(`Full Suite **did not run** for ${source}: this preview was started with it switched off.`);
+    return `${lines.join("\n")}\n`;
+  }
   lines.push(`Full Suite **failed** for ${source} in ${run}. The preview build does not wait for these tests.`, "");
   const legs = unmetLegs(options.legs ?? {}, options.omittedLegs ?? []);
   lines.push(options.legs
@@ -241,16 +250,17 @@ export function stagePreviewNotes(
   failed: PreviewFailures = { suite: true },
 ): string {
   const update = failed.updateRunUrl === undefined ? "" : FAILED_UPDATE_WARNING;
-  if (!failed.suite && !update) return body;
-  const notes = `${failed.suite ? FAILED_SUITE_WARNING : ""}${update}${body}`;
+  const suite = failed.suite ? FAILED_SUITE_WARNING : failed.suiteOff ? OFF_SUITE_WARNING : "";
+  if (!suite && !update) return body;
+  const notes = `${suite}${update}${body}`;
   // The short update line goes first, so a long suite report is what gets cut.
-  const full = [failed.updateRunUrl === undefined ? "" : updateReport(failed.updateRunUrl), failed.suite ? report : ""]
+  const full = [failed.updateRunUrl === undefined ? "" : updateReport(failed.updateRunUrl), suite ? report : ""]
     .filter(Boolean).join("\n");
   const budget = limit - notes.length - 1;
   if (full.length <= budget) return `${notes}\n${full}`;
   const cut = full.lastIndexOf("\n", budget - TRUNCATED_NOTES.length);
   if (cut > 0) return `${notes}\n${full.slice(0, cut)}${TRUNCATED_NOTES}`;
-  const pointed = `${failed.suite ? FAILED_SUITE_POINTER : ""}${update}${body}`;
+  const pointed = `${failed.suite ? FAILED_SUITE_POINTER : failed.suiteOff ? OFF_SUITE_WARNING : ""}${update}${body}`;
   return pointed.length <= limit ? pointed : body;
 }
 
@@ -271,11 +281,13 @@ if (import.meta.main && process.argv[2] === "--stage-notes") {
     process.exit(1);
   }
   const plan = JSON.parse(fs.readFileSync(planPath, "utf8")) as { notes: { body: string } };
-  // Called for a failed suite unless FULL_SUITE_RESULT says it passed.
+  // Called for a failed or switched-off suite unless FULL_SUITE_RESULT says it passed.
   const update = process.env.UPDATE_RESULT;
+  const suiteResult = process.env.FULL_SUITE_RESULT;
   const server = process.env.GITHUB_SERVER_URL ?? "https://github.com";
   plan.notes.body = stagePreviewNotes(plan.notes.body, fs.readFileSync(reportPath, "utf8"), RELEASE_BODY_LIMIT, {
-    suite: process.env.FULL_SUITE_RESULT !== "success",
+    suite: suiteResult !== "success" && suiteResult !== "off",
+    suiteOff: suiteResult === "off",
     ...(update && update !== "success"
       ? { updateRunUrl: `${server}/${process.env.GITHUB_REPOSITORY ?? ""}/actions/runs/${process.env.GITHUB_RUN_ID ?? ""}` }
       : {}),
