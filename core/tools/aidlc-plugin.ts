@@ -12,14 +12,16 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import { DEFAULT_SUBPROCESS_TIMEOUT_MS } from "./aidlc-runtime-budget.ts";
 import {
+  type AgentMetadata,
   committedTextBytes,
   errorMessage,
   parseArgs,
+  readAgents,
   resolveProjectDir,
 } from "./aidlc-lib.ts";
 import { policyPathWithin } from "./aidlc-install-paths.ts";
@@ -337,10 +339,13 @@ function deduplicateInventory(
   };
 }
 
-function currentRootInventory(harness: PluginInventory["harness"]): PluginInventory {
+function currentRootInventory(
+  harness: PluginInventory["harness"],
+  roots: readonly string[] = currentRoots(),
+): PluginInventory {
   const installed: InstalledPlugin[] = [];
   const invalid: InvalidInstalledPlugin[] = [];
-  for (const root of currentRoots()) {
+  for (const root of roots) {
     const entry = invalidFromRoot(root, harness, true);
     if ("root" in entry) installed.push(entry);
     else invalid.push(entry);
@@ -571,10 +576,106 @@ export function discoverPluginInventory(
   harnessDir = runtimeHarnessDir(),
   projectDir = resolveProjectDir(),
 ): PluginInventory {
+  return withReleasePlugins(hostInventory(harnessDir, projectDir), projectDir, harnessDir);
+}
+
+function hostInventory(harnessDir: string, projectDir: string): PluginInventory {
   const harness = harnessKind(harnessDir);
   if (harness === "claude") return claudeInventory(projectDir);
   if (harness === "codex") return codexInventory();
   return currentRootInventory(harness);
+}
+
+// The plugins the running release ships beside its runtime. A native install
+// unpacks them next to the `aidlc` binary, as versions/<version>/plugins/
+// <plugin>/<harness>/; AIDLC_RELEASE_PLUGINS_DIR names a release's plugins
+// folder for a Bun engine, whose project copy carries none, or a test.
+export function releasePluginsDir(): string | null {
+  const explicit = process.env.AIDLC_RELEASE_PLUGINS_DIR?.trim();
+  if (explicit) return absolute(explicit);
+  const executable = compiledExecutable();
+  return executable ? join(dirname(executable), "plugins") : null;
+}
+
+/** The running release's projection of one plugin for one harness, or null. */
+export function releasePluginRoot(plugin: string, distribution: string): string | null {
+  const dir = releasePluginsDir();
+  if (!dir || !SAFE_PLUGIN_KEY.test(plugin) || !SAFE_PLUGIN_KEY.test(distribution)) return null;
+  const root = join(dir, plugin, distribution);
+  return existsSync(join(root, ".aidlc-plugin-projection.json")) && existsSync(join(root, "hooks", "compose.ts"))
+    ? root
+    : null;
+}
+
+/** The plugins the running release ships for one harness. */
+export function releasePluginNames(distribution: string): string[] {
+  const dir = releasePluginsDir();
+  if (!dir || !existsSync(dir)) return [];
+  return readdirSync(dir).filter((name) => releasePluginRoot(name, distribution) !== null).sort();
+}
+
+/** The personas the running release's plugins ship for one harness. */
+export function releasePluginAgents(distribution: string): AgentMetadata[] {
+  return releasePluginNames(distribution).flatMap((name) => {
+    const root = releasePluginRoot(name, distribution)!;
+    // Cursor keeps a plugin's personas under aidlc/agents/, outside its own roster.
+    return [join(root, "agents"), join(root, "aidlc", "agents")]
+      .filter((dir) => existsSync(dir))
+      .flatMap((dir) => readAgents(dir));
+  });
+}
+
+// The release plugins a project knows: each one its selection names or it
+// composed from the release, which its host does not install (a host plugin is
+// the host's to deliver). In use are those the selection leaves on; with no
+// selection, a release plugin is in use only once something composed it, so a
+// release never adds every plugin it ships to every project.
+function projectReleasePlugins(
+  projectDir: string,
+  harnessDir: string,
+  distribution: string,
+  hostKeys: ReadonlySet<string>,
+): { known: string[]; inUse: string[] } {
+  const selection = selectedPlugins(projectDir, harnessDir);
+  const evidence = projectEvidence(projectDir, harnessDir);
+  const composed = new Set([...evidence.stamps.keys(), ...evidence.ownership.keys(), ...evidence.legacy]);
+  const known = releasePluginNames(distribution).filter((name) =>
+    !hostKeys.has(name) && (composed.has(name) || selection?.has(name) === true)
+  );
+  return { known, inUse: known.filter((name) => selection === null || selection.has(name)) };
+}
+
+function withReleasePlugins(
+  inventory: PluginInventory,
+  projectDir: string,
+  harnessDir: string,
+): PluginInventory {
+  let distribution: string;
+  try {
+    distribution = runtimeHarnessName(projectDir, harnessDir);
+  } catch {
+    return inventory;
+  }
+  const hostKeys = new Set([
+    ...inventory.installed.map((plugin) => plugin.key),
+    ...inventory.invalid.flatMap((item) => item.key ? [item.key] : []),
+  ]);
+  // Every release plugin the project knows is listed, so one turned off reads
+  // as installed and disabled rather than missing from the host.
+  const { known, inUse } = projectReleasePlugins(projectDir, harnessDir, distribution, hostKeys);
+  if (known.length === 0) return inventory;
+  const installed = [...inventory.installed];
+  const invalid = [...inventory.invalid];
+  for (const key of known) {
+    const entry = invalidFromRoot(releasePluginRoot(key, distribution)!, inventory.harness, inUse.includes(key));
+    if ("root" in entry) installed.push(entry);
+    else invalid.push({ ...entry, key });
+  }
+  return {
+    ...inventory,
+    installed: installed.sort((left, right) => left.key.localeCompare(right.key)),
+    invalid,
+  };
 }
 
 function harnessDataDir(projectDir: string, harnessDir: string): string {
@@ -1488,12 +1589,22 @@ function compositionIsCurrent(
   plugin: InstalledPlugin,
   evidence: ProjectEvidence,
   projectDir: string,
+  harnessDir: string,
 ): boolean {
   const stamp = evidence.stamps.get(plugin.key);
   if (
     !stamp ||
     stamp.version !== plugin.version ||
     stamp.sourceHash !== plugin.sourceHash
+  ) return false;
+  // Turning a plugin off strips what it merged into core files and its record
+  // of it; composing again is the only way back, so a plugin that ships
+  // contributions and has no record of them in the project is not current.
+  const contributions = join(plugin.root, "contributions");
+  if (
+    existsSync(contributions) &&
+    regularFiles(contributions).some((file) => file.endsWith(".md")) &&
+    !existsSync(join(harnessDataDir(projectDir, harnessDir), `plugin-contrib-${plugin.key}.json`))
   ) return false;
   const ownership = evidence.ownership.get(plugin.key);
   if (!ownership) return false;
@@ -1532,9 +1643,12 @@ export async function syncPlugins(
   argv: string[],
   harnessDir = runtimeHarnessDir(projectDir),
   lockRetry = 0,
+  roots?: readonly string[],
 ): Promise<{ synced: string[]; pruned: string[]; operations: number }> {
   const harness = harnessKind(harnessDir);
-  const inventory = currentRoots().length > 0
+  const inventory = roots
+    ? currentRootInventory(harness, roots)
+    : currentRoots().length > 0
     ? currentRootInventory(harness)
     : discoverPluginInventory(harnessDir, projectDir);
   const evidence = projectEvidence(projectDir, harnessDir);
@@ -1566,8 +1680,9 @@ export async function syncPlugins(
         `plugin sync refused: ${inventory.invalid.map((item) => item.message).join("; ")}`,
       );
     }
-    plugins = inventory.installed;
-    if (plugins.length === 0) {
+    // A release plugin the project turned off is listed, but not composed.
+    plugins = inventory.installed.filter((plugin) => plugin.enabled);
+    if (inventory.installed.length === 0) {
       throw new Error("host inventory unavailable; run sync through an installed plugin's host hook");
     }
   }
@@ -1575,7 +1690,7 @@ export async function syncPlugins(
   announcePrune(argv, pruned);
   if (
     pruned.length === 0 &&
-    plugins.every((plugin) => compositionIsCurrent(plugin, evidence, projectDir))
+    plugins.every((plugin) => compositionIsCurrent(plugin, evidence, projectDir, harnessDir))
   ) {
     return {
       synced: plugins.map((plugin) => plugin.key).sort(),
@@ -1648,13 +1763,13 @@ export async function syncPlugins(
         ) {
           await Bun.sleep(50);
         }
-        return syncPlugins(projectDir, argv, harnessDir, lockRetry + 1);
+        return syncPlugins(projectDir, argv, harnessDir, lockRetry + 1, roots);
       }
       const refreshedEvidence = projectEvidence(projectDir, harnessDir);
       if (
         pruned.length === 0 &&
         plugins.every((plugin) =>
-          compositionIsCurrent(plugin, refreshedEvidence, projectDir)
+          compositionIsCurrent(plugin, refreshedEvidence, projectDir, harnessDir)
         )
       ) {
         return {
@@ -1673,6 +1788,33 @@ export async function syncPlugins(
   } finally {
     rmSync(stagingRoot, { recursive: true, force: true });
   }
+}
+
+/**
+ * Composes the release plugins a project runs with (a cloud chosen with
+ * `config project --cloud`, any release plugin its selection names, and any it
+ * composed before) from the copies the running release ships, through the same
+ * transaction a host hook uses. A plugin already current composes nothing, so
+ * this is what keeps such a plugin on the project's release after a refresh.
+ * Returns the plugins it composed.
+ */
+export async function syncReleasePlugins(
+  projectDir: string,
+  harnessDir: string,
+  distribution: string,
+): Promise<string[]> {
+  const host = hostInventory(harnessDir, projectDir);
+  const hostKeys = new Set(host.capability === "full-inventory" ? host.installed.map((plugin) => plugin.key) : []);
+  const keys = projectReleasePlugins(projectDir, harnessDir, distribution, hostKeys).inUse;
+  if (keys.length === 0) return [];
+  const result = await syncPlugins(
+    projectDir,
+    [],
+    harnessDir,
+    0,
+    keys.map((key) => releasePluginRoot(key, distribution)!),
+  );
+  return result.operations > 0 ? result.synced : [];
 }
 
 function jsonEnvelope(

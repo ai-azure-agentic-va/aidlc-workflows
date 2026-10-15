@@ -42,8 +42,9 @@ The aidlc-aws-platform-agent receives application topology from the aidlc-archit
 ## On Azure or Google Cloud
 
 This agent is the default holder of the cloud-platform seat. When a project
-runs on Microsoft Azure or Google Cloud, install the `azure` or `gcp` plugin
-and choose it with `aidlc config project --cloud azure` (or `gcp`). The
+runs on Microsoft Azure or Google Cloud, choose it with
+`aidlc config project --cloud azure` (or `gcp`); the release ships both cloud
+plugins, so the command sets the chosen one up in the project. The
 plugin's agent (`azure-platform-agent` or `gcp-platform-agent`) then leads and
 supports the same seven stages, with that cloud's Well-Architected review,
 infrastructure-as-code practice (Bicep, or Terraform on Google Cloud), and cost
