@@ -460,7 +460,8 @@ describe("t332 preview publication pipeline", () => {
     expect(jobs.gate).toMatchObject({ needs: "validate" });
     expect(jobs.gate.if).toBeUndefined();
     expect(jobs.full_suite.needs).toEqual(["validate", "gate"]);
-    expect(jobs.full_suite.if).toBeUndefined();
+    // A manual run may switch the Full Suite off; a scheduled run always runs it.
+    expect(jobs.full_suite.if).toBe(`\${{ github.event_name != 'workflow_dispatch' || inputs.full_suite }}`);
     expect(jobs.verify).toBeUndefined();
     expect(jobs["native-smoke"].if).toBe(`\${{ !cancelled() && needs.validate.result == 'success' && needs.gate.result == 'success' && needs.test.result == 'success' && needs.validate.outputs.skip != 'true' }}`);
     expect(jobs.test.if).toBe(`\${{ !cancelled() && needs.validate.result == 'success' }}`);
@@ -468,10 +469,11 @@ describe("t332 preview publication pipeline", () => {
     const testScript = step("test", "Require a finished Full Suite");
     const publicationScript = step("release-result", "Require publication or an intentional preview skip");
     expect(jobs["release-result"].steps?.some(entry => entry.name === "Require a passing Full Suite")).toBe(false);
-    for (const fullSuite of ["success", "failure", "cancelled", "skipped"]) {
-      // Only a suite that never finished blocks the build and its report.
+    for (const fullSuite of ["success", "failure", "off", "cancelled", "skipped"]) {
+      // Only a suite that never finished blocks the build and its report; one
+      // switched off on purpose does not.
       const tests = await runWorkflowStep(testScript, REPO_ROOT, { FULL_SUITE_RESULT: fullSuite });
-      expect(tests.status).toBe(["success", "failure"].includes(fullSuite) ? 0 : 1);
+      expect(tests.status).toBe(["success", "failure", "off"].includes(fullSuite) ? 0 : 1);
       for (const [skip, release] of [["true", "skipped"], ["false", "success"]]) {
         const publication = await runWorkflowStep(publicationScript, REPO_ROOT, {
           VALIDATE_RESULT: "success", TEST_RESULT: tests.status === 0 ? "success" : "failure",
@@ -514,6 +516,10 @@ describe("t332 preview publication pipeline", () => {
     // t-ci-preview-test-report covers the near-limit budget; a plan that size
     // cannot pass through one Windows environment variable.
     expect(await stageNotes("failure", body, small)).toBe(`${warning}${body}\n${small}`);
+    // A preview started with the Full Suite switched off says so instead.
+    const offWarning = "> **Warning:** Full Suite did not run for this source: this preview was started with it " +
+      "switched off, so no test result backs it.\n\n";
+    expect(await stageNotes("off", body, small)).toBe(`${offWarning}${body}\n${small}`);
     // A failed update from the last release warns and reports, but publishes.
     const updateWarning = "> **Warning:** Updating from the last release to this preview failed in its checks. " +
       "Stay on your release or wait for the next preview.\n\n";
@@ -523,6 +529,15 @@ describe("t332 preview publication pipeline", () => {
     expect(await stageNotes("failure", body, small, "failure"))
       .toBe(`${warning}${updateWarning}${body}\n${updateLine}\n${small}`);
   }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("a manual preview can switch the Full Suite off, and every reader of its result sees off", () => {
+    const text = readFileSync(PREVIEW_RELEASE_WORKFLOW, "utf8");
+    expect(text).toMatch(/workflow_dispatch:\n {4}inputs:\n {6}full_suite:\n {8}description: [^\n]+\n {8}type: boolean\n {8}default: true\n/);
+    const reader = `FULL_SUITE_RESULT: \${{ (github.event_name == 'workflow_dispatch' && !inputs.full_suite) && 'off' || ` +
+      `needs.full_suite.outputs.result || 'failure' }}`;
+    expect(text.split(reader).length - 1).toBe(3);
+    expect(text).not.toContain(`FULL_SUITE_RESULT: \${{ needs.full_suite.outputs.result || 'failure' }}`);
+  });
 
   test("preview tracks the exact dispatched run and tolerates its failure without changing Full Suite", async () => {
     const workflow = Bun.YAML.parse(readFileSync(PREVIEW_RELEASE_WORKFLOW, "utf8")) as {
@@ -1472,9 +1487,9 @@ describe("t332 preview publication pipeline", () => {
     });
     expect(preview.jobs.full_suite.uses).toBeUndefined();
     expect(preview.jobs.full_suite.steps?.[0].env?.SOURCE_SHA).toBe(`\${{ needs.validate.outputs.sha }}`);
-    expect(preview.jobs.full_suite.if).toBeUndefined();
+    expect(preview.jobs.full_suite.if).toBe(`\${{ github.event_name != 'workflow_dispatch' || inputs.full_suite }}`);
     expect(preview.jobs.test.needs).toEqual(["validate", "full_suite"]);
-    expect(preview.jobs.test.steps?.[0].env?.FULL_SUITE_RESULT).toBe(`\${{ needs.full_suite.outputs.result || 'failure' }}`);
+    expect(preview.jobs.test.steps?.[0].env?.FULL_SUITE_RESULT).toBe(`\${{ (github.event_name == 'workflow_dispatch' && !inputs.full_suite) && 'off' || needs.full_suite.outputs.result || 'failure' }}`);
     expect(preview.jobs.test.if).not.toContain("needs.validate.outputs.skip");
     // The report lists this run's jobs, so only the report job reads Actions.
     expect(preview.jobs.test.permissions).toEqual({ actions: "read", contents: "read" });
@@ -1484,7 +1499,7 @@ describe("t332 preview publication pipeline", () => {
     expect(testStep("List Full Suite jobs")?.env?.FULL_SUITE_RUN_ID).toBe(`\${{ needs.full_suite.outputs.run_id }}`);
     expect(testStep("Report Full Suite results")?.env?.FULL_SUITE_RUN_ID).toBe(`\${{ needs.full_suite.outputs.run_id }}`);
     expect(preview.jobs.release.steps?.find(step => step.name === "Stage preview notes")?.env?.FULL_SUITE_RESULT)
-      .toBe(`\${{ needs.full_suite.outputs.result || 'failure' }}`);
+      .toBe(`\${{ (github.event_name == 'workflow_dispatch' && !inputs.full_suite) && 'off' || needs.full_suite.outputs.result || 'failure' }}`);
     expect(testStep("Report Full Suite results")?.run).toContain("bun scripts/ci-preview-test-report.ts");
     expect(testStep("Report Full Suite results")?.run).toContain(`>>"$GITHUB_STEP_SUMMARY"`);
     expect(preview.jobs.test.steps?.some((step) => step.with?.name === "preview-test-report")).toBe(true);

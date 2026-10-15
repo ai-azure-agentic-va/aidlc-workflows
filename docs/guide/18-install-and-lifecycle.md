@@ -1439,7 +1439,9 @@ new preview with the next build counter.
 
 A preview still publishes when its nightly tests fail. Its release notes then
 open with a warning and end with a Full Suite failure report (failed jobs and
-any failing tests), so check it before relying on a preview.
+any failing tests), so check it before relying on a preview. A preview started
+by hand with the Full Suite switched off says in its notes that no test result
+backs it.
 
 A preview id is `<x.y.(z+1)>-preview.<YYYYMMDD>.<N>`: the next patch after the
 source tree's current stable version, the UTC build date chosen during

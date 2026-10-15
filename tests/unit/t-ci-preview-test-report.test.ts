@@ -19,6 +19,7 @@ import {
   failedJobs,
   jobGroup,
   MAX_REPORT,
+  OFF_SUITE_WARNING,
   parseFailures,
   RELEASE_BODY_LIMIT,
   renderReport,
@@ -320,6 +321,18 @@ describe("t-ci-preview-test-report", () => {
     const pointed = "x".repeat(RELEASE_BODY_LIMIT - FAILED_SUITE_POINTER.length - FAILED_UPDATE_WARNING.length);
     expect(stagePreviewNotes(pointed, report, RELEASE_BODY_LIMIT, both))
       .toBe(`${FAILED_SUITE_POINTER}${FAILED_UPDATE_WARNING}${pointed}`);
+  });
+
+  test("a preview started with the Full Suite switched off says it did not run, not that it failed", () => {
+    const text = report([], { fullSuiteResult: "off" });
+    expect(text).toBe(
+      "## Nightly test report\n\nFull Suite **did not run** for `0123456789ab`: this preview was started with it switched off.\n",
+    );
+    expect(text).not.toContain("failed");
+    const body = "- change\n\nSource commit: owner/repo@a\n";
+    expect(stagePreviewNotes(body, text, RELEASE_BODY_LIMIT, { suite: false, suiteOff: true }))
+      .toBe(`${OFF_SUITE_WARNING}${body}\n${text}`);
+    expect(OFF_SUITE_WARNING).not.toContain("failed");
   });
 
   test("the command stages a failing preview's notes in the plan file", () => {
