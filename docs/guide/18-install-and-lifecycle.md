@@ -959,21 +959,30 @@ aidlc config project --reset --yes
 ```
 
 `--cloud` chooses the cloud the platform stages design for: `aws` (the core
-AWS Platform Agent, the default) or an installed cloud plugin, such as
-`azure` or `gcp`. It turns that cloud plugin on and every other cloud plugin
-off, so it is a plugin choice and is recorded in the same `plugins` selection;
-`--show` reports the cloud in use and the choices. The selection it writes
-names each plugin, so any plugin installed later is added turned off until you
-turn it on with `--plugins`; the command says so the first time. Switching
-removes the earlier cloud's notes from the stages and agents at once, and the
-new cloud plugin adds its own at the next session start (or `/aidlc plugin
-sync`). When work is open, the command says which agent its platform stages
-now run with. Install a cloud plugin through your host first, the way any
-plugin is installed (see
-[Authoring a Plugin](../harness-engineering/10-authoring-a-plugin.md#5-distribution--install));
-`--cloud` refuses a cloud the project does not have yet and lists the ones it
-does. Run interactively, `aidlc config project` asks for the cloud when at
-least one cloud plugin is installed.
+AWS Platform Agent, the default), or a cloud plugin, such as `azure` or `gcp`.
+The release ships those two beside its runtime, so nothing has to be installed
+first: choosing one records it in the project's `plugins` selection and then
+sets the plugin up from the copy the release ships, in one more transaction,
+and says so in one line. A cloud plugin installed through the host is offered
+too, and the host keeps delivering it. `--cloud` turns the chosen cloud plugin
+on and every other cloud plugin off, so it is a plugin choice and is recorded
+in the same `plugins` selection; `--show` reports the cloud in use and the
+choices. The selection it writes names each plugin, so any plugin installed
+later is added turned off until you turn it on with `--plugins`; the command
+says so the first time. Switching removes the earlier cloud's notes from the
+stages and agents at once, and the chosen cloud's notes come back with it.
+When work is open, the command says which agent its platform stages now run
+with. Run interactively, `aidlc config project` asks for the cloud when there
+is a choice.
+
+A plugin set up from the release follows it: every `aidlc config` sets it up
+again from the copy the running release ships, so after `aidlc update` the next
+`aidlc config` brings the project's cloud plugin to the new release. Doctor and
+`aidlc engine plugin list` count it as installed, on or off. `--plugins` takes a
+release plugin's name too, with the same effect. A copy-channel project has no
+release beside it: install a cloud plugin through your host (see
+[Authoring a Plugin](../harness-engineering/10-authoring-a-plugin.md#5-distribution--install)),
+or point `AIDLC_RELEASE_PLUGINS_DIR` at a release's `plugins/` folder.
 
 A plugin turned off with `--plugins` or `--cloud` loses what it merged into
 core stages and agents, as `/aidlc plugin select` strips it; turning it on

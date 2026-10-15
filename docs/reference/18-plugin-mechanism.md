@@ -309,6 +309,36 @@ for sync and for the compose hook alike (the rule in
 Neither list, doctor, nor sync checks a remote plugin registry. The host remains
 responsible for published-version discovery.
 
+### Release plugins
+
+Every release ships its first-party plugins beside its runtime: the release
+archive holds `plugins/<plugin>/<harness>/` projections, and a native install
+unpacks them next to the `aidlc` binary
+(`versions/<version>/plugins/<plugin>/<harness>/`). `releasePluginsDir()` in
+`core/tools/aidlc-plugin.ts` finds that folder for the running engine;
+`AIDLC_RELEASE_PLUGINS_DIR` names one for a Bun engine, whose project copy
+carries none, or a test. A projection counts only with its
+`.aidlc-plugin-projection.json` marker and `hooks/compose.ts`.
+
+A project uses a release plugin its selection names, or one it composed from
+the release, unless the host installs that plugin itself (a host plugin is the
+host's to deliver). With no selection, a release plugin is used only once
+something composed it, so a release never adds every plugin it ships to every
+project. Every `aidlc config` run that commits a change, `config project
+--cloud` and `--plugins` included, then calls `syncReleasePlugins`: each
+release plugin in use is composed from the running release's copy through the
+same transaction a host hook uses (`syncPlugins` with those roots), so a
+plugin follows the project's release across updates. A plugin already current
+composes nothing. The inventory that `plugin list`, doctor and `plugin sync`
+read adds the release plugins a project knows to the host's list, on or off,
+so a release plugin turned off reads as installed and disabled, never as
+missing from the host or due for `--prune-missing`.
+
+A composition is current only when its stamp, its owned files, and, for a
+plugin that ships contributions, its contribution sidecar are all present: a
+plugin turned off loses the sidecar with its merged contributions, so turning
+it on again composes them back.
+
 For source-tree installs, the `plugin-sync` utility verb (the compose hooks'
 fallback front) runs discovered plugin roots' `hooks/compose.ts` files and
 exits cleanly with
@@ -536,7 +566,10 @@ which cloud's services to read for the AWS ones they name.
 `aidlc config project --cloud <aws|plugin>` is the project choice: it turns the
 named cloud plugin on and every other cloud plugin off (or all of them off for
 `aws`) in the `plugins` selection, which stays the one record of it, and writes
-an explicit selection, so any plugin installed later composes turned off. A
+an explicit selection, so any plugin installed later composes turned off. The
+choice needs no host install: the cloud plugins a release ships are offered,
+and the chosen one is composed from the release (see
+[Release plugins](#release-plugins)). A
 plugin named `aws` fills the slot but is never a `--cloud` choice; every
 `--cloud` turns it off. `aidlc config project --show` reports the cloud in use
 and the choices, and a switch while work is open says which agent its platform

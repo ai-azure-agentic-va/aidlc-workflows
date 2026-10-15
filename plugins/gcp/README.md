@@ -23,25 +23,29 @@ off gives every stage back to the AWS agent and removes its notes.
 
 ## 2. How to use it
 
-1. Install the plugin through your host, the way any AIDLC plugin is installed
-   (see [Distribution + install](../../docs/harness-engineering/10-authoring-a-plugin.md#5-distribution--install)).
-   For Claude Code:
+Every AI-DLC release ships this plugin beside its runtime, so a project needs
+no plugin install. Choose Google Cloud for the project:
 
-   ```
-   /plugin marketplace add <your-repo-or-path>/dist/plugins/gcp/claude
-   /plugin install aidlc-gcp@aidlc-plugins
-   # start a fresh session: the SessionStart hook composes the plugin
-   ```
+```bash
+aidlc config project --cloud gcp --yes
+aidlc config project --show        # Cloud: gcp (choices: aws, azure, gcp)
+```
 
-2. Choose Google Cloud for the project:
+The command sets the plugin up from the copy the release ships, and every
+later `aidlc config` keeps it on the project's release. `--cloud aws` gives
+the stages back to the AWS agent. Only one cloud plugin is on at a time;
+`--cloud` turns the others off.
 
-   ```bash
-   aidlc config project --cloud gcp --yes
-   aidlc config project --show        # Cloud: gcp (choices: aws, gcp)
-   ```
+A copy-channel project has no release beside it. There, install the plugin
+through your host, the way any AIDLC plugin is installed (see
+[Distribution + install](../../docs/harness-engineering/10-authoring-a-plugin.md#5-distribution--install)),
+then run the same `--cloud`. For Claude Code:
 
-   `--cloud aws` gives the stages back to the AWS agent. Only one cloud plugin
-   is on at a time; `--cloud` turns the others off.
+```
+/plugin marketplace add <your-repo-or-path>/dist/plugins/gcp/claude
+/plugin install aidlc-gcp@aidlc-plugins
+# start a fresh session: the SessionStart hook composes the plugin
+```
 
 ## 3. Layout
 

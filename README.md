@@ -58,8 +58,9 @@ aidlc doctor
 
 Replace `claude` with `kiro`, `kiro-ide`, `codex`, `cursor`, `opencode`, or
 `copilot`. The platform stages design for AWS by default; for Microsoft Azure
-or Google Cloud, install the `azure` or `gcp` plugin and choose it with
-`aidlc config project --cloud azure` (see
+or Google Cloud, run `aidlc config project --cloud azure` (or `gcp`): the
+release ships both cloud plugins, and the command sets the one you choose up
+in the project (see
 [Project Choices](docs/guide/18-install-and-lifecycle.md#project-choices)). Running `aidlc config` without `--harness` starts the interactive
 setup when a terminal is available. If you use Kiro IDE's own terminal in a
 project folder you have not trusted yet, Kiro first asks whether you trust it.

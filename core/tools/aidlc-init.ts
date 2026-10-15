@@ -157,7 +157,14 @@ import {
   withAuditLock,
   writeFileAtomic,
 } from "./aidlc-lib.ts";
-import { cutPluginFragment, editTomlInstructions, personaTwinRels } from "./aidlc-plugin.ts";
+import {
+  cutPluginFragment,
+  editTomlInstructions,
+  personaTwinRels,
+  releasePluginAgents,
+  releasePluginNames,
+  syncReleasePlugins,
+} from "./aidlc-plugin.ts";
 import { regenerateRunnerSurfaces } from "./aidlc-runner-gen.ts";
 import { KIRO_IDE_STEERING, kiroIdeSteering, refreshActiveMemory } from "./aidlc-includes.ts";
 import {
@@ -3547,6 +3554,15 @@ function projectAgents(harnessRoot: string): AgentMetadata[] {
   return existsSync(dir) ? readAgents(dir) : [];
 }
 
+// The personas a cloud can be chosen from: the project's own, then those of
+// the plugins its release ships, which a choice composes. A persona the
+// project already carries wins.
+function cloudRoster(harnessRoot: string, distribution: string): AgentMetadata[] {
+  const own = projectAgents(harnessRoot);
+  const slugs = new Set(own.map((agent) => agent.slug));
+  return [...own, ...releasePluginAgents(distribution).filter((agent) => !slugs.has(agent.slug))];
+}
+
 // `--cloud` is a plugin choice: the named cloud plugin on and every other
 // cloud plugin off, or every cloud plugin off for the core cloud. The plugin
 // selection stays the one record of it, and the choice makes it explicit, so a
@@ -3575,20 +3591,24 @@ function applyCloudAnswer(
   return [...new Set(value === CORE_CLOUD ? base : [...base, value])].sort();
 }
 
-// The cloud the selection runs on and the clouds on offer. When the cloud
+// The cloud the selection runs on and the clouds on offer, the release's
+// cloud plugins included. The cloud is read from the personas the project
+// carries, since a release plugin is in use only once it is composed. When it
 // cannot be told (more than one cloud plugin on, or an agent file that does
 // not parse), the cloud is null and the problem says why and what to do.
 function projectCloud(
   harnessRoot: string,
+  distribution: string,
   plugins: string[] | null,
 ): { cloud: string | null; choices: string[]; problem?: string } {
   let agents: AgentMetadata[];
+  let choices: string[];
   try {
     agents = projectAgents(harnessRoot);
+    choices = cloudChoices(cloudRoster(harnessRoot, distribution));
   } catch (error) {
     return { cloud: null, choices: [CORE_CLOUD], problem: errorMessage(error) };
   }
-  const choices = cloudChoices(agents);
   try {
     return {
       cloud: selectedCloud(agents, (plugin) => plugins === null || plugins.includes(plugin)),
@@ -3630,15 +3650,18 @@ function buildProjectRecord(
     dirname(selected.root),
     selected.harnessDir,
   );
+  // A plugin the release ships can be named before it is composed: choosing it
+  // composes it from the release once the selection is recorded.
+  const offered = [...new Set([...known, ...releasePluginNames(selected.distribution)])].sort();
   const plugins = applyCloudAnswer(
     valueAfter(argv, "--cloud"),
     parsePluginAnswer(
       valueAfter(argv, "--plugins"),
-      known,
+      offered,
       currentPlugins,
     ),
     known,
-    () => projectAgents(selected.root),
+    () => cloudRoster(selected.root, selected.distribution),
   );
   return {
     record: normalizeProjectChoicesRecord(next) as ProjectChoicesRecord,
@@ -3698,7 +3721,7 @@ function showChoiceSection(
     };
   } else {
     const completion = records.project?.completions;
-    const { cloud, choices: cloudOptions, problem: cloudProblem } = projectCloud(selected.root, plugins);
+    const { cloud, choices: cloudOptions, problem: cloudProblem } = projectCloud(selected.root, selected.distribution, plugins);
     data = {
       section,
       harness: selected.harness,
@@ -3914,7 +3937,7 @@ function choiceWizard(
   // parse leaves the question out, and graph compile names the file.
   let clouds: string[] = [CORE_CLOUD];
   try {
-    clouds = cloudChoices(projectAgents(selected.root));
+    clouds = cloudChoices(cloudRoster(selected.root, selected.distribution));
   } catch {
     // Keep the core cloud only.
   }
@@ -11892,8 +11915,8 @@ function projectChangeLines(projectDir: string, context: ChoicesMutationContext)
 // what the earlier one produced.
 function cloudSwitchLines(projectDir: string, context: ChoicesMutationContext): string[] {
   const root = join(projectDir, context.harnessDir);
-  const before = projectCloud(root, context.previousPlugins).cloud;
-  const after = projectCloud(root, context.nextPlugins).cloud;
+  const before = projectCloud(root, context.distribution, context.previousPlugins).cloud;
+  const after = projectCloud(root, context.distribution, context.nextPlugins).cloud;
   if (before === null || after === null || before === after) return [];
   const open = activeWorkflowDescriptions(projectDir);
   if (open.length === 0) return [];
@@ -13467,6 +13490,19 @@ export async function main(
     } else {
       executeSettingsAndProjectMutation(settingsMutation, plan);
     }
+    // The release plugins the project runs with (a cloud chosen with --cloud,
+    // or any the selection names) are composed from the copies this release
+    // ships, and one composed before follows the release on every refresh.
+    // The recorded change stands either way; a failure names the retry.
+    let releasePlugins: string[] = [];
+    try {
+      releasePlugins = await syncReleasePlugins(projectDir, descriptor.harnessDir, descriptor.distribution);
+    } catch (error) {
+      throw new Error(
+        `the project change is recorded, but a plugin this release ships was not set up: ${errorMessage(error)}. ` +
+          `Run \`${configInvocationFor(projectDir)} engine plugin sync\` to try again.`,
+      );
+    }
     // The copy of the active space's memory that the harness includes read is
     // written now, before a chat loads them, so the first chat holds the rules
     // it loaded and is not handed them again on every step (#1330). Best-effort,
@@ -13559,6 +13595,9 @@ export async function main(
         ))
     );
     if (choicesContext?.section === "project") changes.push(...projectChangeLines(projectDir, choicesContext));
+    if (releasePlugins.length > 0) {
+      changes.push(`Set up the ${releasePlugins.join(", ")} plugin${releasePlugins.length === 1 ? "" : "s"} this release ships.`);
+    }
     const openLine = recordOnly && reachesWork && settingsMutation
       ? openWorkflowLine(
         projectDir,
