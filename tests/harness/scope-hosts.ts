@@ -29,14 +29,12 @@ import {
   activeRecord,
   cleanupScopeProjects,
   clip,
-  commandWords,
   createScopeProject,
   expectedStages,
   type RunResult,
   runScope,
   SCOPE_RUN_TIMEOUT_MS,
   ScopeHost,
-  RESUME_AGAIN,
   ScopeRunRefused,
   ScopeRunStuck,
   type ScopeRun,
@@ -224,8 +222,8 @@ export abstract class NativeScopeHost extends ScopeHost {
   private uses = 0;
   protected turn = "";
 
-  constructor(proj: string) {
-    super(proj);
+  constructor(proj: string, base?: NodeJS.ProcessEnv) {
+    super(proj, base);
     // The tool gives its hooks and the agent's shell the project as their folder, and no Claude variable.
     delete this.env.CLAUDE_PROJECT_DIR;
     this.fullHost = true;
@@ -268,8 +266,7 @@ export abstract class NativeScopeHost extends ScopeHost {
     this.fired.push({ event, tool, commands });
     const input = JSON.stringify(this.payload(event, fields));
     return commands.map((line) => {
-      const words = commandWords(line);
-      const res = this.spawn(`${event}${tool ? ` ${tool}` : ""}: ${line}`, [words[0] === "bun" ? process.execPath : words[0], ...words.slice(1)], input, this.hookEnv());
+      const res = this.spawn(`${event}${tool ? ` ${tool}` : ""}: ${line}`, this.argv(line), input, this.hookEnv());
       if (res.status !== 0 && !(res.status === 2 && /^(PreToolUse|preToolUse|Stop|stop)$/.test(event))) {
         this.hookFailures.push(`${event}${tool ? ` ${tool}` : ""}: ${line} exited ${res.status}: ${clip(res.stderr || res.stdout, 400)}`);
       }
@@ -288,9 +285,7 @@ export abstract class NativeScopeHost extends ScopeHost {
   }
 
   protected run(line: string): RunResult {
-    const words = commandWords(line);
-    if (words[0] !== "bun") throw new Error(`the stand-in runs only bun commands, got: ${line}`);
-    return this.spawn(line, [process.execPath, ...words.slice(1)], undefined, this.shellEnv());
+    return this.spawn(line, this.argv(line), undefined, this.shellEnv());
   }
 
   override hook(name: string): RunResult {
@@ -313,6 +308,7 @@ export abstract class NativeScopeHost extends ScopeHost {
 /** Codex CLI: `.codex/hooks.json` through `engine adapter codex`, apply_patch for files, spawn_agent for helpers. */
 export class CodexScopeHost extends NativeScopeHost {
   override readonly dir = ".codex";
+  override readonly skill = ".agents/skills/aidlc/SKILL.md";
 
   protected override sessionName(n: number): string {
     return `019ee000-${hex(this.hostNumber, 4)}-7000-8000-${hex(n, 12)}`;
@@ -435,6 +431,7 @@ export class CodexScopeHost extends NativeScopeHost {
  */
 export class CopilotScopeHost extends NativeScopeHost {
   override readonly dir = ".aidlc";
+  override readonly skill = ".github/skills/aidlc/SKILL.md";
   override readonly picker = false;
 
   protected override sessionName(n: number): string {
@@ -562,6 +559,7 @@ export function kiroSkillPrompt(proj: string, args: string): string {
  */
 export class KiroCliScopeHost extends NativeScopeHost {
   override readonly dir = ".kiro";
+  override readonly skill = ".kiro/skills/aidlc/SKILL.md";
   override readonly picker = false;
   protected override readonly stopEvent = "stop";
   /** The agent whose JSON hooks fire: the conductor's, or a helper's own while it works. */
@@ -682,6 +680,7 @@ export class KiroCliScopeHost extends NativeScopeHost {
  */
 export class KiroIdeScopeHost extends NativeScopeHost {
   override readonly dir = ".kiro";
+  override readonly skill = ".kiro/skills/aidlc/SKILL.md";
   override readonly picker = false;
   private readonly shellTool = process.platform === "win32" ? "execute_pwsh" : "execute_bash";
 
@@ -788,6 +787,7 @@ export class KiroIdeScopeHost extends NativeScopeHost {
  */
 export class CursorScopeHost extends NativeScopeHost {
   override readonly dir = ".cursor";
+  override readonly skill = ".cursor/skills/aidlc/SKILL.md";
   override readonly picker = false;
   protected override readonly stopEvent = "stop";
 
@@ -929,25 +929,32 @@ interface PluginAnswer {
  * in its environment, which the plugin's hooks inherit. A refusal is the hook's
  * thrown error; a turn end that blocks sends a nudge through
  * `client.session.prompt`. A helper is a child session whose parent the client
- * names. A new chat after a stop for the day is a new opencode process, so the
- * plugin starts again. The agent's shell carries `OPENCODE=1`.
+ * names. A new chat after a stop for the day is a new opencode process, which
+ * loads the plugin again. The agent's shell carries `OPENCODE=1` and the chat
+ * the plugin's `shell.env` names for it.
  */
 export class OpencodeScopeHost extends ScopeHost {
   override readonly dir = ".aidlc";
+  override readonly skill = ".aidlc/skills/aidlc/SKILL.md";
   override readonly picker = false;
   override readonly removesDispatch = false;
   private readonly sab = new SharedArrayBuffer(8 + (16 << 20));
   private readonly flag = new Int32Array(this.sab, 0, 2);
-  private readonly worker: Worker;
+  private worker!: Worker;
   private readonly hostNumber = ++hostCount;
   private child: string | null = null;
   private uses = 0;
 
-  constructor(proj: string) {
-    super(proj);
+  constructor(proj: string, base?: NodeJS.ProcessEnv) {
+    super(proj, base);
     delete this.env.CLAUDE_PROJECT_DIR;
     this.fullHost = true;
     this.session = this.sessionName(1);
+    this.launch();
+  }
+
+  /** An opencode process: the plugin loaded from the project as it is now, with state of its own. */
+  private launch(): void {
     this.worker = new Worker(join(import.meta.dir, "opencode-plugin-worker.ts"), { workerData: { sab: this.sab, env: this.env } });
     this.worker.unref();
     this.startPlugin();
@@ -981,7 +988,12 @@ export class OpencodeScopeHost extends ScopeHost {
   }
 
   /** A tool call through the plugin: before (a throw refuses it, as in opencode), the call, then after. */
-  private tool<T>(tool: string, args: Record<string, unknown>, act: (args: Record<string, unknown>) => T, result: (value: T) => string): T {
+  private tool<T>(
+    tool: string,
+    args: Record<string, unknown>,
+    act: (args: Record<string, unknown>, call: { sessionID: string; callID: string }) => T,
+    result: (value: T) => string,
+  ): T {
     const sessionID = this.child ?? this.session;
     const callID = `call_${hex(this.hostNumber, 4)}_${++this.uses}`;
     const before = this.hookCall("tool.execute.before", { tool, sessionID, callID }, { args });
@@ -990,7 +1002,7 @@ export class OpencodeScopeHost extends ScopeHost {
       throw new ScopeRunRefused(`the plugin refused ${tool} ${clip(JSON.stringify(args), 200)}`, before.refused);
     }
     const ran = (before.output?.args as Record<string, unknown> | undefined) ?? args;
-    const value = act(ran);
+    const value = act(ran, { sessionID, callID });
     this.hookCall("tool.execute.after", { tool, sessionID, callID, args: ran }, { output: result(value) });
     return value;
   }
@@ -1003,8 +1015,9 @@ export class OpencodeScopeHost extends ScopeHost {
   protected override startChat(): void {}
 
   override newSession(): void {
-    // The next day is a new opencode process: the plugin starts again.
-    this.startPlugin();
+    // The next day is a new opencode process, which loads the plugin again.
+    void this.worker.terminate();
+    this.launch();
     super.newSession();
   }
 
@@ -1024,10 +1037,12 @@ export class OpencodeScopeHost extends ScopeHost {
   }
 
   override bash(line: string): RunResult {
-    return this.tool("bash", { command: line, description: "Run the step AI-DLC named" }, (args) => {
-      const words = commandWords(String(args.command ?? line));
-      if (words[0] !== "bun") throw new Error(`the stand-in runs only bun commands, got: ${line}`);
-      return this.spawn(String(args.command ?? line), [process.execPath, ...words.slice(1)], undefined, { ...this.env, OPENCODE: "1" });
+    return this.tool("bash", { command: line, description: "Run the step AI-DLC named" }, (args, call) => {
+      const ran = String(args.command ?? line);
+      // opencode asks the plugin for the command's environment, which names its chat.
+      const env = this.hookCall("shell.env", { cwd: this.proj, ...call }, { env: {} }).output?.env as Record<string, string> | undefined;
+      if (!env?.AIDLC_SESSION_OVERRIDE) throw new ScopeRunStuck(`the opencode plugin named no chat for ${clip(ran, 200)}`);
+      return this.spawn(ran, this.argv(ran), undefined, { ...this.env, OPENCODE: "1", ...env });
     }, (res) => `${res.stdout}${res.stderr}`);
   }
 
@@ -1088,15 +1103,16 @@ function parseJson(text: string): Record<string, unknown> | null {
 // Projects
 // ---------------------------------------------------------------------------
 
-function hostFor(name: "claude" | HostName, proj: string): ScopeHost {
+/** The host that plays a tool on a project; `base` is the environment the person's machine gives it. */
+export function hostFor(name: "claude" | HostName, proj: string, base?: NodeJS.ProcessEnv): ScopeHost {
   switch (name) {
-    case "claude": return new ScopeHost(proj);
-    case "codex": return new CodexScopeHost(proj);
-    case "copilot": return new CopilotScopeHost(proj);
-    case "kiro": return new KiroCliScopeHost(proj);
-    case "kiro-ide": return new KiroIdeScopeHost(proj);
-    case "cursor": return new CursorScopeHost(proj);
-    case "opencode": return new OpencodeScopeHost(proj);
+    case "claude": return new ScopeHost(proj, base);
+    case "codex": return new CodexScopeHost(proj, base);
+    case "copilot": return new CopilotScopeHost(proj, base);
+    case "kiro": return new KiroCliScopeHost(proj, base);
+    case "kiro-ide": return new KiroIdeScopeHost(proj, base);
+    case "cursor": return new CursorScopeHost(proj, base);
+    case "opencode": return new OpencodeScopeHost(proj, base);
   }
 }
 
@@ -1122,12 +1138,6 @@ export const SKIPPED = [
   "nfr-requirements", "nfr-design", "infrastructure-design",
 ];
 export const UNITS = ["core", "api"];
-
-/**
- * Detours the journey meets today, each with a test.todo named after it in
- * tests/integration/t-scope-host-claude.test.ts; the fix removes it here.
- */
-export const KNOWN_JOURNEY_DETOURS: readonly string[] = [RESUME_AGAIN];
 
 export interface HostJourney {
   run: ScopeRun;
@@ -1199,9 +1209,7 @@ export function hostJourneyProblems(journey: HostJourney): string[] {
   if (shards.length !== 2 || shards.at(-1) !== basename(firstShard)) {
     problems.push(`the work's audit shards are ${JSON.stringify(shards)}: not the first clone's, sorting last, and one from the fresh clone`);
   }
-  for (const detour of run.agent.detours) {
-    if (!KNOWN_JOURNEY_DETOURS.includes(detour)) problems.push(`the person was sent round a detour: ${detour}`);
-  }
+  for (const detour of run.agent.detours) problems.push(`the person was sent round a detour: ${detour}`);
   if (new Set(chats).size !== 2) problems.push(`the person used chats ${JSON.stringify(chats)}, not two`);
   const checkpoints = run.agent.asked.filter((a) => a.what === "unit checkpoint").map((a) => a.unit);
   if (JSON.stringify(checkpoints) !== JSON.stringify(UNITS)) problems.push(`Unit checkpoints asked for ${JSON.stringify(checkpoints)}, not each Unit once`);

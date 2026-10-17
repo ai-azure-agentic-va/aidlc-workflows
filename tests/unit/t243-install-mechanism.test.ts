@@ -127,6 +127,7 @@ const CLAUDE_RELEASE = join(REPO_ROOT, "dist-release", "claude");
 const CODEX_RELEASE = join(REPO_ROOT, "dist-release", "codex");
 const COPILOT_RELEASE = join(REPO_ROOT, "dist-release", "copilot");
 const CURSOR_RELEASE = join(REPO_ROOT, "dist-release", "cursor");
+const CURSOR_COPY = join(REPO_ROOT, "dist", "cursor");
 const KIRO_IDE_COPY = join(REPO_ROOT, "dist", "kiro-ide");
 const KIRO_IDE_RELEASE = join(REPO_ROOT, "dist-release", "kiro-ide");
 const OPENCODE_RELEASE = join(REPO_ROOT, "dist-release", "opencode");
@@ -3015,12 +3016,14 @@ describe("t243 project initialization", () => {
     mkdirSync(join(project, ".git"));
     const config = join(project, "install.ts");
     writeFileSync(config, "// the project's own install script\n");
+    // The copy runtime is the tree that still writes a whole file (its
+    // installer); native setup leaves it out.
     const initialized = run(INIT, [
       "config",
       "--project-dir",
       project,
       "--from",
-      CURSOR_RELEASE,
+      CURSOR_COPY,
       "--harness",
       "cursor",
       "--force",
@@ -4287,9 +4290,74 @@ describe("t243 project initialization", () => {
     expect(readFileSync(file, "utf-8")).toBe(shipped);
   }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
 
-  // The command a conflict names is the one of the harness being set up, not
-  // the first install a project shows: a first Codex install names Codex's own.
-  test("a first install's conflict names the command of the harness being set up", () => {
+  // No config section takes --force, so a section's conflict names config
+  // itself, from the source the section used, then the section once more; on
+  // a copied tool with --from and natively from the installed release, the
+  // command it names and then the section both go through. A mirror URL can
+  // carry its credential, so the line asks for it back and never prints it.
+  test("a section's conflict names the config command that takes --force, and it and the section go through", () => {
+    const machine = temp("aidlc-t243-section-conflict-machine-");
+    const launcher = join(temp("aidlc-t243-section-conflict-launcher-"), INSTALLED_EXECUTABLE);
+    try {
+      linkSync(BUN, launcher);
+    } catch {
+      cpSync(BUN, launcher);
+    }
+    const MIRROR = "https://user:tok@mirror.example/releases";
+    // A copy of Bun under the name aidlc stands in for the compiled executable.
+    const channels = [
+      { name: "copied", tool: BUN, from: ["--from", CLAUDE_RELEASE], named: ["bun", ".claude/tools/aidlc.ts", "config", "--from", CLAUDE_RELEASE, "--force"] },
+      { name: "native", tool: launcher, from: [], named: ["aidlc", "config", "--force"] },
+      { name: "mirror", tool: launcher, from: ["--download", "--release-base-url", MIRROR], named: ["aidlc", "config", "--download", "--force"] },
+    ];
+    for (const channel of channels) {
+      const project = temp(`aidlc-t243-section-conflict-${channel.name}-`);
+      mkdirSync(join(project, ".git"));
+      const env = {
+        AIDLC_RUNTIME_ROOT: join(REPO_ROOT, "dist-release"),
+        AIDLC_INSTALL_ROOT: machine,
+        AIDLC_BIN_DIR: join(machine, "bin"),
+      };
+      const config = (args: string[]) =>
+        spawnSync(channel.tool, [INIT, "config", ...args], {
+          cwd: project,
+          env: { ...process.env, ...env },
+          encoding: "utf-8",
+          timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+        });
+      const installed = config(["--project-dir", project, ...channel.from, "--harness", "claude", "--mcp", "none", "--yes"]);
+      expect(installed.status, `${channel.name}: ${installed.stdout}${installed.stderr}`).toBe(0);
+      const file = join(project, ".claude", "agents", "aidlc-developer-agent.md");
+      const shipped = readFileSync(file, "utf-8");
+      writeFileSync(file, `${shipped}\nmy own notes\n`);
+      const section = ["project", ...channel.from, "--mcp", "defaults", "--yes"];
+      const refused = config(section);
+      expect(refused.status, `${channel.name}: ${refused.stdout}${refused.stderr}`).toBe(4);
+      const out = refused.stdout.replace(/\s+/g, " ");
+      expect(out, channel.name).not.toContain("run it again with --force");
+      // A dry run repeats this conflict while it stands, so the line names none.
+      expect(out, channel.name).not.toContain("--dry-run");
+      const json = config([...section, "--json"]);
+      expect(json.status, channel.name).toBe(4);
+      expect(refused.stdout + refused.stderr + json.stdout + json.stderr, channel.name).not.toContain("tok@");
+      const mirror = channel.from.includes("--release-base-url");
+      const asked = mirror ? " with the same --release-base-url" : "";
+      const named = new RegExp(`to take the shipped version over it, run \`([^\`]+)\`${asked}, then the same command again\\.`).exec(out)?.[1];
+      expect(printedWords(named ?? ""), `${channel.name}: ${out}`).toEqual(channel.named);
+      const forced = config([
+        ...printedWords(named ?? "").slice(channel.named.indexOf("config") + 1),
+        ...(mirror ? ["--release-base-url", MIRROR] : []),
+      ]);
+      expect(forced.status, `${channel.name}: ${forced.stdout}${forced.stderr}`).toBe(0);
+      expect(readFileSync(file, "utf-8"), channel.name).toBe(shipped);
+      const again = config(section);
+      expect(again.status, `${channel.name}: ${again.stdout}${again.stderr}`).toBe(0);
+    }
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  // A first install's conflict names no other harness's tool: a first Codex
+  // install never points at .claude.
+  test("a first install's conflict names no other harness's command", () => {
     for (const [harness, release, agent] of [
       ["codex", CODEX_RELEASE, join(".codex", "agents", "aidlc-developer-agent.toml")],
       ["claude", CLAUDE_RELEASE, join(".claude", "agents", "aidlc-developer-agent.md")],
@@ -4305,8 +4373,8 @@ describe("t243 project initialization", () => {
       const out = refused.stdout.replace(/\s+/g, " ");
       // The conflict line names the path with forward slashes on every OS.
       expect(out).toContain(`${agent.replaceAll("\\", "/")} (locally modified or unowned)`);
-      const dir = harness === "codex" ? ".codex" : ".claude";
-      expect(out, harness).toContain(`\`bun ${dir}/tools/aidlc.ts config --dry-run --verbose\` lists every change first`);
+      expect(out, harness).toContain("to take the shipped version over it, run it again with --force.");
+      expect(out, harness).not.toContain("--dry-run");
       if (harness === "codex") expect(out).not.toContain(".claude/tools/aidlc.ts");
       expect(readFileSync(join(project, agent), "utf-8")).toBe("my own agent\n");
     }
@@ -8512,6 +8580,7 @@ describe("t243 projection channel", () => {
           "sha256:a21217e44700aa0d6e703ebb524c4e07a3c4c12f7097d1923034b10b9a6d0549",
           "sha256:6c6ff7641c17829d77fdd023f340b938db11dcc26c734a0c452d5213f9bd19cf",
           "sha256:f9d49a8c823df8174ea7d8a83209380202e5673b5ee8c1ff6b9cce90bcfd550e",
+          "sha256:e7c17271c65f778895fe75352413c03da8a3c37c37bca2b8bcb1c447f4c8b8f3",
         ],
         "AGENTS.md": [
           "sha256:4d539288363565feb6cf1a8d2468d1aca4373d46d354936d89e609f9862b2b9f",
@@ -8613,6 +8682,8 @@ describe("t243 projection channel", () => {
           "sha256:ad6ccb9e0d8fbfc3224448ed45c6d3b278ffb8afdffe697ef2f362cfafeb44bf",
           "sha256:fde31c458f35dc77c83845acdad3d4715a4c87a219f2004fc6c96625c7933d29",
           "sha256:724c2e36547e1eab35a3637595cea3f4bf1ddecf75fb798e0e165932c06cd93e",
+          "sha256:b0f5e39317a501be8567bbb0ecbdff651116abc28a500b9c451b732ca8f2e088",
+          "sha256:b87a3ec2c39cb24074c6fa37f626e9d150d435d18069fbd0c762fdbd70719c5c",
         ],
       },
     };

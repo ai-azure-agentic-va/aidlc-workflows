@@ -260,7 +260,9 @@ describe("t354 config project --cloud", () => {
     });
     expect(step.directive?.stage, step.out).toBe(stage);
     expect(step.directive?.lead_agent).toBe("gcp-platform-agent");
-    expect(step.directive?.inline_context_paths).toContain(".claude/agents/gcp-platform-agent.md");
+    const persona = step.directive?.lead_persona as { path?: string; text?: string } | undefined;
+    expect(persona?.path).toBe(".claude/agents/gcp-platform-agent.md");
+    expect(persona?.text).toContain("slot: cloud-platform");
     expect(step.directive?.inline_context_paths).toContain(
       ".claude/knowledge/gcp-platform-agent/terraform-best-practices.md",
     );

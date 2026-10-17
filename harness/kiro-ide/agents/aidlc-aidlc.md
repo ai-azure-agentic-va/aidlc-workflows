@@ -54,10 +54,12 @@ permissions:
         - "aidlc-quality-agent"
         - "aidlc-pipeline-deploy-agent"
         - "aidlc-operations-agent"
+        - "aidlc-scoped-review-*"
     - capability: filesystem
       effect: allow
       match:
         - "aidlc/spaces/**"
+        - ".aidlc/worktrees/*/aidlc/spaces/**"
         - "{{HARNESS_DIR}}/sensors/**"
         - "aidlc/.aidlc-compose-pending"
         - "aidlc/.aidlc-request-text/**"

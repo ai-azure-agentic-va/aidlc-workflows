@@ -322,8 +322,7 @@ way it applies to this piece of work and records a `CEREMONY_SET` row; a plan al
 your answer then builds. A question or remark that mentions plan approval
 changes nothing. Before the work exists, at the compose gate or the scope
 confirmation, your words answer that request: the piece of work created from it
-starts with plan approval off, set by you (the creation line says
-`no plan approval`). Said before you describe the work, they answer the next
+starts with plan approval off, set by you. Said before you describe the work, they answer the next
 request you make, or, where other work is here and you pick it up instead, they
 apply to that work and you hear so once. Work created from any other request keeps its scope's value,
 and typing `/aidlc --plan-approval on` first takes the words back. The agent never turns it off on its own and never
@@ -596,7 +595,7 @@ The file is AI-DLC's, so the next `aidlc config` in the project stops at your ed
 ```text
 $ aidlc config --harness claude --yes
 error: 1 config conflict(s): .claude/hooks/aidlc-statusline.ts (locally modified or unowned)
-fix: to keep your version, move .claude/hooks/aidlc-statusline.ts somewhere else and run the same command again; to take the shipped version over it, run it again with --force. `aidlc config --dry-run --verbose` lists every change first.
+fix: to keep your version, move .claude/hooks/aidlc-statusline.ts somewhere else and run the same command again; to take the shipped version over it, run it again with --force.
 ```
 
 Keep a copy of your version before you take the shipped one with `--force`.

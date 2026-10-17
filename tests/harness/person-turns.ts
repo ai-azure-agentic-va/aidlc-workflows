@@ -48,15 +48,18 @@ function audit(): AuditReader {
 }
 const auditBlockField = (block: string, field: string) => audit().auditBlockField(block, field);
 
-// The engine's own check that a quote is the person's words (log answer
-// --on-instruction makes it too), loaded on first use like the reader above.
-let quoteCheck: ((said: string, quoted: string) => boolean) | undefined;
-function holdsQuote(said: string, quoted: string): boolean {
-  quoteCheck ??= (require("../../dist/claude/.claude/tools/aidlc-message-store.ts") as {
-    holdsQuote: (said: string, quoted: string) => boolean;
-  }).holdsQuote;
-  return quoteCheck(said, quoted);
+type MessageStore = Pick<
+  typeof import("../../dist/claude/.claude/tools/aidlc-message-store.ts"),
+  "holdsQuote" | "readMessage" | "messageIsReply" | "latestSpendingTimestamp"
+>;
+let messages: MessageStore | undefined;
+// The engine's own message store and checks, loaded on first use like the reader above.
+function messageStore(): MessageStore {
+  messages ??= require("../../dist/claude/.claude/tools/aidlc-message-store.ts") as MessageStore;
+  return messages;
 }
+// The engine's own check that a quote is the person's words (log answer --on-instruction makes it too).
+const holdsQuote = (said: string, quoted: string) => messageStore().holdsQuote(said, quoted);
 
 /** Events in one audit shard, keyed by space, intent and shard name. */
 type AuditTrail = Map<string, AuditShardEvent[]>;
@@ -142,8 +145,10 @@ const gateItem = (row: AuditShardEvent) =>
  * one exception: it answers the question the menu showed, so when the agent
  * logs that question only after the submission, the submission still backs
  * its answer if nothing was decided between them (the engine's own rule, a
- * reply since the last decision). Approvals and
- * answers need a reply: a turn that was only a command (as the human-turn hook
+ * reply since the last decision). An answer that names the person's message
+ * (log answer --message, or the Message Id of the question it answers) is
+ * backed by that message as the engine binds it: see namedMessageTurn.
+ * Approvals and answers need a reply: a turn that was only a command (as the human-turn hook
  * reads it) does not count. A command still backs what it
  * can ask for: a stage reopened by a jump, a changed project type.
  *
@@ -205,6 +210,13 @@ export function unbackedDecisions(projectDir: string, start: AuditCursor, turns:
     for (let index = 0; index < events.length; index++) {
       const row = events[index];
       const stage = auditBlockField(row.block, "Stage") ?? "";
+      // One answer to a grouped code plan question writes one row per plan, back to back, alike but for its Unit (an
+      // approval, or the change request): the rows after the first are that same answer, backed (or reported) once.
+      const prior = events[index - 1];
+      const field = (block: string, name: string) => auditBlockField(block, name);
+      const sameAnswer = prior !== undefined && row.event === prior.event && field(row.block, "Checkpoint") === "plan-approval" &&
+        ["Stage", "Checkpoint", "Session", "Details"].every((name) => field(row.block, name) === field(prior.block, name)) &&
+        field(row.block, "Unit") !== null && field(prior.block, "Unit") !== null && field(row.block, "Unit") !== field(prior.block, "Unit");
       const pending = open.get(stage);
       const closes = DECISION_CLOSING_EVENTS.has(row.event);
       const gate = row.event === "GATE_APPROVED" || row.event === "GATE_REJECTED";
@@ -257,7 +269,7 @@ export function unbackedDecisions(projectDir: string, start: AuditCursor, turns:
         since = resolved;
         reply = false;
       }
-      if (since !== undefined && index >= first) {
+      if (since !== undefined && index >= first && !sameAnswer) {
         const after = Math.max(since + 1, first);
         const needsReply = reply;
         const quoted = instruction;
@@ -270,6 +282,7 @@ export function unbackedDecisions(projectDir: string, start: AuditCursor, turns:
         });
         let backing = quoted === "" ? -1 : backs(after, false);
         if (backing === -1 && menuSince !== undefined) backing = backs(Math.max(menuSince + 1, first), true);
+        if (backing === -1 && closes && quoted === undefined) backing = namedMessageTurn(projectDir, events, index, turns, born, key);
         if (backing === -1) problems.push(describe(row, key, turns));
         else if (answer) used[backing]++;
       }
@@ -300,6 +313,33 @@ export function unbackedDecisions(projectDir: string, start: AuditCursor, turns:
     }
   }
   return problems;
+}
+
+// An answer to a question the agent logged after the reply arrived names the
+// message that answered (log answer --message, or the question's own Message
+// Id). The engine binds it when the record carries the person's words, came
+// through the chat that answers and no approval or other spending row came
+// after it (proveMessage in aidlc-log.ts). The answer is then backed by the
+// driver's turn that sent those words before the row. The chat that answers
+// is the one that spoke last in this shard: a driver types into one chat at a
+// time.
+function namedMessageTurn(
+  projectDir: string, events: readonly AuditShardEvent[], index: number, turns: readonly PersonTurn[], born: number, key: string,
+): number {
+  const row = events[index];
+  const id = auditBlockField(row.block, "Message Id");
+  if (row.event !== "QUESTION_ANSWERED" || id === null) return -1;
+  const store = messageStore();
+  const message = store.readMessage(projectDir, id);
+  if (message === null || !store.messageIsReply(events, message)) return -1;
+  const before = events.slice(0, index);
+  const spentAt = store.latestSpendingTimestamp(before);
+  if (spentAt !== null && message.at < spentAt) return -1;
+  const speaking = before.findLast((earlier) => earlier.event === "HUMAN_TURN");
+  const chat = speaking === undefined ? null : auditBlockField(speaking.block, "Session");
+  if (chat !== null && message.session !== chat) return -1;
+  return turns.findLastIndex((turn, which) => which >= born && (turn.cursor.get(key) ?? 0) <= index &&
+    turn.words.trim() === message.text.trim() && !isCommand(turn.words));
 }
 
 // The questions open when a turn arrived `at` this point of a shard: each one

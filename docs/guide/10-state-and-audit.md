@@ -83,9 +83,10 @@ changing the state file:
 Unit/batch checkpoint. A matching current-workflow human approval receipt is
 required before `state set-construction-verification-command` writes the field;
 the field alone never authorizes execution, and generic `state set` refuses it.
-The human's **Approve** / **Request Changes** reply must come from the
-invoking SessionStart session. Only **Approve** authorizes the receipt; an
-unrelated reply, **Request Changes**, or a reply from another session does not.
+The human's **Approve** / **Request Changes** reply counts in the chat that
+asked or in a new one while it is the newest question asked. Only **Approve**
+authorizes the receipt; an unrelated reply, **Request Changes**, or a reply to
+another question does not.
 See the [recorded-command flow](12-cli-commands.md#construction-verification-command-record-human-authorization).
 
 ### Six-state checkboxes
@@ -151,7 +152,7 @@ means. The write guard is a guardrail, not a security boundary. See
 [Audit Trail Rules](../reference/04-stage-protocol.md#audit-trail-rules) for
 the owning commands and the read-only query contract.
 
-### 118-event taxonomy
+### 119-event taxonomy
 
 Events are organized into 25 categories:
 
@@ -159,7 +160,7 @@ Events are organized into 25 categories:
 |----------|------:|--------|
 | **Workflow Lifecycle** | 7 | `WORKFLOW_STARTED`, `WORKFLOW_COMPLETED`, `WORKFLOW_PARKED`, `WORKFLOW_UNPARKED`, `WORKFLOW_ARCHIVED`, `WORKFLOW_UNARCHIVED`, `INTENT_REPOS_CHANGED` |
 | **Phase Lifecycle** | 4 | `PHASE_STARTED`, `PHASE_COMPLETED`, `PHASE_VERIFIED`, `PHASE_SKIPPED` |
-| **Stage Lifecycle** | 6 | `STAGE_STARTED`, `STAGE_AWAITING_APPROVAL`, `STAGE_REVISING`, `STAGE_COMPLETED`, `STAGE_SKIPPED`, `STAGE_JUMPED` |
+| **Stage Lifecycle** | 7 | `STAGE_STARTED`, `STAGE_AWAITING_APPROVAL`, `STAGE_REVISING`, `STAGE_COMPLETED`, `STAGE_SKIPPED`, `STAGE_JUMPED`, `STAGE_DEFINITION_CHANGED` |
 | **Session** | 6 | `SESSION_STARTED`, `SESSION_RESUMED`, `SESSION_COMPACTED`, `SESSION_ENDED`, `HUMAN_TURN` (hook-emitted), `HOST_TURN` (hook-emitted, advisory: a prompt the host made for the agent, never a person's turn) |
 | **Initialization** | 3 | `WORKSPACE_SCAFFOLDED`, `WORKSPACE_SCANNED`, `WORKSPACE_INITIALISED` |
 | **Navigation** | 9 | `SCOPE_CHANGED`, `SCOPE_DETECTED`, `DEPTH_CHANGED`, `TEST_STRATEGY_CHANGED`, `REVIEW_CLASS_CHANGED`, `RECOMPOSED`, `WORKSPACE_RECLASSIFIED`, `SCOPE_SAVED`, `PLUGIN_SELECTION_CHANGED` |

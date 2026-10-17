@@ -314,7 +314,8 @@ recovery protocol's Session resume says, never as Request Changes.
   feedback; pass `--reason` only to add your own summary beside them. Ask
   "What should change?" only when they did not say.
 - **They asked a question:** answer it and end the turn. Their next reply
-  decides.
+  decides. When the same reply also answered a question you record, add
+  `--ends-turn` to that `log answer`.
 - **Their intent is genuinely unclear:** ask one short question, as a colleague
   would, and end the turn.
 - **Their words on a command line:** where the engine keeps their words (a
@@ -799,9 +800,11 @@ Both read commands return JSON, write nothing, and take no lock. Their `data_not
 
 Each stage specifies its lead and supporting agents. To load a persona:
 
-On inline stages and for the inline lead of a mob, `inline_context_paths` lists
-the team's knowledge right after the personas and before the shipped
-methodology: read it in the order listed.
+On inline stages and for the inline lead of a mob, the step carries the lead's
+persona itself (`lead_persona`: its file and its text), and
+`inline_context_paths` lists what the chat still reads: the supports' personas
+on an inline stage, then the team's knowledge, then the shipped methodology.
+Read it in the order listed.
 
 ### For inline stages and the inline lead of a mob:
 1. Before `run-stage`, apply every `load-steering.rules_content` entry in order
@@ -809,11 +812,13 @@ methodology: read it in the order listed.
    substantive active-space rule as content; there is no size-based path
    fallback. `run-stage.rules_in_context` is the ordered path manifest for the
    completed bundle.
-2. Read every path in `inline_context_paths`. On `inline`, the engine expands
-   the lead and every support agent into exact persona + existing knowledge
-   files. On `mob`, the roster holds the lead's persona and knowledge only,
-   because supports are dispatched: read all of it. An agent name by itself
-   is not loaded context. Knowledge remains path-loaded until the retrieval
+2. Take on `lead_persona`: you work the stage as that agent. A step that
+   carries none lists the lead's persona file first in `inline_context_paths`
+   instead. Read every path in `inline_context_paths`. On `inline`, the engine
+   expands every support agent into exact persona + existing knowledge files,
+   beside the lead's knowledge. On `mob`, the roster holds the lead's knowledge
+   only, because supports are dispatched: read all of it. An agent name by
+   itself is not loaded context. Knowledge remains path-loaded until the retrieval
    layer lands. Show any `context_warnings` verbatim and continue with the
    readable roster.
 3. This is a blocking precondition, not a manifest hint. The first tool calls
@@ -822,8 +827,7 @@ methodology: read it in the order listed.
    with the harness file-read tool and wait for the result. Do not read the
    stage file or consumes, initialize the diary, run the body, dispatch mob
    supports, or write artifacts until every required inline-context read has
-   completed. In particular, a mob must load its lead persona first, then every
-   knowledge path after it.
+   completed.
 4. Do not silently omit any listed path. Apply each loaded inline perspective
    when executing the stage.
 

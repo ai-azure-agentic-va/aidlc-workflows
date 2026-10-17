@@ -196,9 +196,6 @@ import {
   CEREMONY_KEYS,
   type CeremonyKey,
   type CeremonyPolicy,
-  ceremonyOffClause,
-  ceremonyOffList,
-  ceremonyPolicyValues,
   formatCeremony,
   parseCeremonySetting,
   parseCeremonyStateLine,
@@ -264,6 +261,8 @@ import {
   legacyWorktreePath,
   listIntents,
   workToPickUp,
+  finishedWork,
+  workStanding,
   listSpaces,
   ARCHIVED_INTENT_STATUS,
   clearActiveIntentCursor,
@@ -365,6 +364,11 @@ import {
   inspectSubagentInflight,
   harnessDataPath,
   pluginsEnabled,
+  pluginsSelected,
+  pausedPlugins,
+  pausedBySelection,
+  pausedLine,
+  composedPluginBase,
   projectDescriptionFilePath,
   PROJECT_DESCRIPTION_FILE,
   scalarField,
@@ -430,6 +434,7 @@ import {
   UTILITY_COMMANDS,
   carryPendingPersonLines,
   isKiroConductorAgentFile,
+  isScopedReviewCopy,
   KIRO_CONDUCTOR_AGENT_FILE,
   PERSON_ASKED_SKIP_REASON,
 } from "./aidlc-lib.ts";
@@ -440,6 +445,7 @@ import {
   captureStageValidationBasis,
   codeArrivedStageLine,
   inspectStageValidity,
+  stageDefinitionChangedLine,
   stageLabel,
   staleStageNote,
 } from "./aidlc-validity.ts";
@@ -1401,6 +1407,19 @@ function stripDisabledPluginContributions(
   return stripped;
 }
 
+// The one turn-off rule, run in the staged tree a selection is built in by
+// plugin select and by every config refresh: a plugin that tree's selection
+// leaves off or pauses keeps nothing it merged into core stages and personas,
+// nor its record of it, so its compose merges it back once it is on again.
+// The implicit core plugin merges nothing.
+export function stripPluginsTurnedOff(): string[] {
+  const active = pluginsEnabled();
+  if (active === null) return [];
+  return stripDisabledPluginContributions(
+    knownPluginNames().filter((name) => name !== "aidlc" && !active.has(name)),
+  );
+}
+
 // A selection change must not strand a live workflow: after disable, a state
 // file whose Scope belongs to a disabled plugin makes every later /aidlc on
 // that workflow hard-error ("Unknown scope") with no in-band way out (the
@@ -1479,7 +1498,7 @@ export function activeWorkflowPluginDependencies(
 
 function handleSelectPlugins(projectDir: string, positional: string[]): void {
   if (positional.length === 1) {
-    const selection = renderPluginSelection(pluginsEnabled());
+    const selection = renderPluginSelection(pluginsSelected());
     process.stdout.write(
       `Current plugin selection: ${selection}\nKnown plugins: ${knownPluginNames().join(", ")}\n`,
     );
@@ -1506,22 +1525,29 @@ function handleSelectPlugins(projectDir: string, positional: string[]): void {
     if (unknown.length > 0) {
       die(`Unknown plugin name(s): ${unknown.join(", ")}. Valid plugins: ${known.join(", ")}.`);
     }
-    const violations = activeWorkflowDependencyViolations(projectDir, new Set(names));
+    // A plugin kept in the list whose base is left out is paused: off for
+    // everything that runs, still in the person's list.
+    const nameSet = new Set(names);
+    const pausedBefore = pausedPlugins();
+    const pausedAfter = pausedBySelection(nameSet, (plugin) => composedPluginBase(dirname(harnessDataPath()), plugin));
+    const active = new Set(names.filter((name) => !pausedAfter.has(name)));
+    const violations = activeWorkflowDependencyViolations(projectDir, active);
     if (violations.length > 0) {
+      const pausedWhy = [...pausedAfter]
+        .filter(([plugin]) => violations.some((v) => v.includes(`plugin "${plugin}"`)))
+        .map(([plugin, base]) => `  ${plugin} would be paused: ${plugin} builds on ${base}, which this selection leaves off.\n`)
+        .join("");
       die(
         `select-plugins refused: the new selection would strand ${violations.length} active workflow dependency(ies):\n` +
           violations.map((v) => `  - ${v}`).join("\n") +
+          (pausedWhy ? `\n${pausedWhy.trimEnd()}` : "") +
           `\nComplete or archive the workflow(s) first (\`${entrySkillInvocation()} intent archive <name>\`; a parked workflow ` +
           "still needs its plugin when it resumes), or keep the plugin enabled, then re-run select-plugins.",
       );
     }
 
-    const previousSelection = renderPluginSelection(pluginsEnabled());
+    const previousSelection = renderPluginSelection(pluginsSelected());
     const newSelection = names.join(", ");
-    const nameSet = new Set(names);
-    // Plugins this change DISABLES (known but not selected; the implicit core
-    // plugin has no composed contributions to strip).
-    const disabling = known.filter((n) => n !== "aidlc" && !nameSet.has(n));
 
     const stagingRoot = mkdtempSync(join(tmpdir(), "aidlc-plugin-select-"));
     const stagedProject = join(stagingRoot, "project");
@@ -1542,10 +1568,11 @@ function handleSelectPlugins(projectDir: string, positional: string[]): void {
         process.env.AIDLC_HARNESS_DIR = selectedHarness;
         process.env.AIDLC_RUNTIME_HARNESS_ROOT = join(stagedProject, selectedHarness);
         resetSelectionSensitiveCaches();
-        // Strip disabled contributions in staging before recompiling. The live
-        // project remains byte-untouched until the shared transaction commits.
-        strippedPlugins = stripDisabledPluginContributions(disabling);
+        // Strip what the new selection turns off in staging before recompiling.
+        // The live project remains byte-untouched until the shared transaction
+        // commits.
         writePluginSelection(stagedProject, names);
+        strippedPlugins = stripPluginsTurnedOff();
         regenerateSelectionSurfaces(stagedProject, projectDir);
       } finally {
         for (const key of envKeys) {
@@ -1569,12 +1596,25 @@ function handleSelectPlugins(projectDir: string, positional: string[]): void {
         },
       });
       resetSelectionSensitiveCaches();
-      if (strippedPlugins.length > 0) {
+      // A paused plugin is stripped too, but it comes back when its base is on
+      // again, not when it is: its pause line says so.
+      const strippedOff = strippedPlugins.filter((plugin) => !pausedAfter.has(plugin));
+      if (strippedOff.length > 0) {
         process.stdout.write(
-          `Stripped merged contributions of disabled plugin(s): ${strippedPlugins.join(", ")} (re-enabling restores them on the next session start)\n`,
+          `Stripped merged contributions of disabled plugin(s): ${strippedOff.join(", ")} (re-enabling restores them on the next session start)\n`,
         );
       }
       process.stdout.write(`Enabled plugins: ${names.join(", ")}\n`);
+      // Said once: at the select that pauses a plugin, never again after.
+      for (const [plugin, base] of pausedAfter) {
+        if (pausedBefore.get(plugin) === base) continue;
+        const rest = names.filter((name) => name !== plugin);
+        process.stdout.write(`${pausedLine(
+          plugin,
+          base,
+          rest.length > 0 ? `${entrySkillInvocation()} plugin select ${rest.join(",")}` : null,
+        )}\n`);
+      }
     } catch (err) {
       resetSelectionSensitiveCaches();
       die(`select-plugins failed: ${errorMessage(err)}`);
@@ -1584,16 +1624,18 @@ function handleSelectPlugins(projectDir: string, positional: string[]): void {
   }, undefined, undefined, WORKSPACE_MUTATION_LOCK_RETRIES);
 }
 
-function pluginListRows(): Array<{ name: string; enabled: boolean }> {
-  const selected = pluginsEnabled();
+function pluginListRows(): Array<{ name: string; enabled: boolean; pausedFor?: string }> {
+  const active = pluginsEnabled();
+  const paused = pausedPlugins();
   return knownPluginNames().map((name) => ({
     name,
-    enabled: selected === null || selected.has(name),
+    enabled: active === null || active.has(name),
+    ...(paused.has(name) ? { pausedFor: paused.get(name) } : {}),
   }));
 }
 
 function handlePluginList(flags: Record<string, string>): void {
-  const selected = pluginsEnabled();
+  const selected = pluginsSelected();
   const rows = pluginListRows();
   if (flags.json === "true") {
     process.stdout.write(
@@ -1607,7 +1649,11 @@ function handlePluginList(flags: Record<string, string>): void {
 
   process.stdout.write(
     `Plugin selection: ${renderPluginSelection(selected)}\n` +
-      rows.map((row) => `${row.name} ${row.enabled ? "enabled" : "disabled"}`).join("\n") +
+      rows.map((row) =>
+        row.pausedFor
+          ? `${row.name} paused: needs ${row.pausedFor}, which is off`
+          : `${row.name} ${row.enabled ? "enabled" : "disabled"}`
+      ).join("\n") +
       (rows.length > 0 ? "\n" : ""),
   );
 }
@@ -1935,6 +1981,30 @@ function codeScannedClause(projectDir: string, intent: string | undefined, space
   }
 }
 
+// The work here while none is selected in this conversation (a teammate's
+// clone, a chat that has not joined it): each piece by name and where it
+// stands, then the two ways on. Null when no record is here.
+function workHereStatus(projectDir: string, space: string): string | null {
+  const present = listIntents(projectDir, space, null).filter((intent) => intent.dirName !== null);
+  const shown = present.filter((intent) => !isArchivedIntent(intent));
+  if (shown.length === 0) return null;
+  const finished = new Set(finishedWork(projectDir, space, null).map((intent) => intent.dirName));
+  const states = new Map((workToPickUp(projectDir, space, null) ?? []).map(({ intent, state }) => [intent.dirName, state]));
+  const lines = shown.map((intent) => {
+    const record = isSafeIntentRecordName(intent.dirName) ? intent.dirName : JSON.stringify(intent.dirName);
+    const label = intentDisplayLabel(intent);
+    const where = finished.has(intent.dirName) ? "finished" : workStanding(states.get(intent.dirName) ?? "") || "in progress";
+    return `  ${label === record ? record : `${label} (record ${record})`}: ${where}\n`;
+  });
+  const archived = present.length - shown.length;
+  const entry = entrySkillInvocation();
+  return `No work is selected in this conversation. Work in this project${space === DEFAULT_SPACE ? "" : ` (space "${space}")`}:\n` +
+    lines.join("") +
+    (archived > 0 ? `  (${archived} archived; ${entry} intent list --all shows ${archived === 1 ? "it" : "them"})\n` : "") +
+    `\nTo carry on with one, or go back to one of its stages: ${entry} intent <record>\n` +
+    `To start new work: ${entry} "build the auth service"\n`;
+}
+
 function handleStatus(projectDir: string, flags: Record<string, string>): void {
   // --intent <record> / --space <name> target a specific intent's status
   // (vision §5); omitted -> the active record.
@@ -1948,6 +2018,7 @@ function handleStatus(projectDir: string, flags: Record<string, string>): void {
       : stateFilePath(projectDir, selection.intent, selection.space);
   if (!existsSync(sp)) {
     process.stdout.write(
+      (selection.intent === null ? workHereStatus(projectDir, selection.space) : null) ??
       `No active AI-DLC workflow found.
 
 To get started:
@@ -2211,6 +2282,17 @@ To get started:
       const otherNames = stageNames(others);
       validityOutput = staleStageNote(earliestName, earliestIssue, content) +
         `${otherNames ? ` Also affected: ${otherNames}.` : ""}\n`;
+    }
+    // Finished stages AI-DLC itself now does differently, told or not on the
+    // way: the work stands, and the way back is named.
+    const pending = new Set(validity.redefined.map((entry) => entry.stage));
+    const redefined = graph.map((stage) => stage.slug)
+      .filter((slug) => pending.has(slug) || validity.renewed.includes(slug));
+    if (redefined.length > 0) {
+      validityOutput += `${stageDefinitionChangedLine(
+        redefined.map((slug) => stageLabel(findStageBySlug(slug), slug) ?? slug),
+        redefined[0],
+      )}\n`;
     }
   } catch {
     // Unreadable receipts change nothing the person can act on here.
@@ -3317,12 +3399,15 @@ function kiroPluginSelection(root: string): ReadonlySet<string> | null {
   try {
     const value = JSON.parse(text) as Record<string, unknown>;
     if (!value || typeof value !== "object" || !Array.isArray(value.plugins)) return null;
-    return new Set(
+    const selected = new Set(
       value.plugins
         .filter((name): name is string => typeof name === "string")
         .map((name) => name.trim())
         .filter((name) => name.length > 0),
     );
+    // A paused plugin reads as off, as everywhere else that runs.
+    const paused = pausedBySelection(selected, (plugin) => composedPluginBase(join(root, "tools", "data"), plugin));
+    return new Set([...selected].filter((name) => !paused.has(name)));
   } catch {
     return null;
   }
@@ -3373,7 +3458,9 @@ function kiroIdeFrameworkReads(projectDir: string, harness: string): string[] {
   const inactiveRunners = new Set<string>();
   if (graph === null) {
     for (const path of markdownUnder("aidlc-common/stages")) reads.add(path);
-    for (const path of markdownUnder("agents")) if (!isKiroConductorAgentFile(path)) reads.add(path);
+    for (const path of markdownUnder("agents")) {
+      if (!isKiroConductorAgentFile(path) && !isScopedReviewCopy(path)) reads.add(path);
+    }
     for (const path of markdownUnder("knowledge")) reads.add(path);
   } else {
     for (const node of graph) {
@@ -3572,10 +3659,9 @@ export function kiroIdeIgnoreSourceChecks(
 // What stops working when the person switches an AI-DLC hook off in Kiro's
 // Agent Hooks. Legacy names stay while config has not yet removed their files.
 const FLOW_ALTERING_KIRO_HOOKS: Record<string, string> = {
-  "aidlc-guard-tool-call": "approvals, the approved plan, reviewed work and AI-DLC's records are not protected",
+  "aidlc-guard-tool-call": "the approved plan, reviewed work and AI-DLC's records are not protected",
   "aidlc-record-human-turn": "your replies are not recorded, so approval gates cannot tell your answer from the assistant's, and /aidlc commands typed in chat are not run directly",
   "aidlc-continue-workflow": "a workflow with work left is not kept moving when the assistant stops (on Kiro CLI v3; Kiro IDE only records it)",
-  "aidlc-enforce-approval-gate": "the assistant is not held while an approval waits for your answer",
   "aidlc-plan-approval-guard": "the build is not kept to the plan you approved",
   "aidlc-terminal-command-guard": "commands are not checked before they run",
   "aidlc-state-transition-guard": "workflow state can change without the engine",
@@ -4828,7 +4914,7 @@ export async function collectDoctorReport(
         : `Plugin selection flags: ${disagreements.length} disagreement(s)`,
       fix: disagreements.length > 0
         ? `${disagreements.join("; ")} - run \`${aidlcDispatcherInvocation("plugin select")} ${
-            selected === null ? knownPluginNames().join(",") : [...selected].sort().join(",")
+            [...(pluginsSelected() ?? knownPluginNames())].sort().join(",")
           }\` to recover`
         : undefined,
     });
@@ -6259,7 +6345,8 @@ export async function collectDoctorReport(
   // Sub-case (c): PRACTICES_OVERRIDE Reason filter — write-failure-* rows
   //   without a following PRACTICES_AFFIRMED are flagged as orphan; rows
   //   carrying Reason: bolt-plan-marker-conflict are expected behaviour and
-  //   ignored. audit-format.md:138 anchors the discriminator routing.
+  //   ignored. The PRACTICES_OVERRIDE row in audit-format.md anchors the
+  //   discriminator routing.
   //
   // Sub-case (c) shares the orphan-audit umbrella because both classes ride
   // the same audit-walker pass; per plan-v3 §51, this is one Check, not two.
@@ -6369,8 +6456,7 @@ export async function collectDoctorReport(
   //
   // Read `Practices Affirmed Timestamp` from main state. Compare to now.
   // Empty / missing → informational pass (never affirmed). Within 90 days → ✓.
-  // Older → advisory pass=true (does NOT fail exit code; mirrors heartbeat
-  // and state/audit drift advisory pattern at aidlc-utility.ts:421-466).
+  // Older → advisory pass=true (does NOT fail exit code).
   // Invalid ISO timestamp → fail readable.
   // ---------------------------------------------------------------------------
   try {
@@ -10538,12 +10624,20 @@ function handleCodekbSnapshot(
               `source, leaving that one out.`),
       );
     }
+    // The commit the Run Record names, so the scan agent runs no git for it.
+    // git finds the repository above a project folder too.
+    const head = spawnSync("git", ["rev-parse", "--verify", "-q", "HEAD"], {
+      cwd: repoDir,
+      encoding: "utf-8",
+      timeout: DEFAULT_SUBPROCESS_TIMEOUT_MS,
+    });
     return {
       repo,
       store: `${relativeCodekbDir(projectDir, repo, space)}/`,
       paths,
       store_generation: codekbStoreGeneration(storeDir),
       source_fingerprint: sourceFingerprint,
+      head_commit: head.status === 0 ? head.stdout.trim() : "unknown",
     };
   });
   if (flags.json === "true") {
@@ -10553,7 +10647,8 @@ function handleCodekbSnapshot(
   process.stdout.write(
     `STORE_GENERATION ${snapshot.store_generation}\n` +
       `SOURCE_FINGERPRINT ${snapshot.source_fingerprint}\n` +
-      `SOURCE_PATHS ${snapshot.paths.join(",")}\n`,
+      `SOURCE_PATHS ${snapshot.paths.join(",")}\n` +
+      `HEAD_COMMIT ${snapshot.head_commit}\n`,
   );
 }
 
@@ -11806,10 +11901,7 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
         : 0;
       const stageDelta = executeStages.length - oldExecuteCount;
       const deltaStr = stageDelta >= 0 ? `+${stageDelta}` : String(stageDelta);
-      const summary = {
-        ...gridCostSummary(adjustedMapping as Record<string, "EXECUTE" | "SKIP">),
-        off: ceremonyOffList(newScope, ceremonyPolicyValues(newScope, content)),
-      };
+      const summary = gridCostSummary(adjustedMapping as Record<string, "EXECUTE" | "SKIP">);
       const gates = summary.gates;
       const effectiveDepth = getField(content, "Depth") || "unknown";
       auditEntries.unshift(
@@ -11859,7 +11951,7 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
       // is what they asked for, and `next` carries on into it.
       outputLines = [
         `Switched to ${newScope} (${SCOPE_GLOSS}): ${summary.shown} stages (${shownDone} done), ` +
-          `${gates} approval gates${ceremonyOffClause(summary)}.` +
+          `${gates} approval gates.` +
           (isScopeName(oldScope) ? ` You can switch back to ${oldScope} any time.` : ""),
         ...skippedNow.map(({ slug, was }) =>
           `Skipped ${findStageBySlug(slug)?.name ?? slug} (${was}): ${newScope} does not run it. ` +
