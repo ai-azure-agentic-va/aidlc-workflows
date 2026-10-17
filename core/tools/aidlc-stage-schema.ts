@@ -65,6 +65,11 @@ export interface StageFrontmatter {
     artifact: string;
     required: boolean;
     conditional_on?: "brownfield" | "greenfield";
+    // cited - the deliverables cite this input whenever it exists; the compile
+    // lists these consumes as the stage's `cites`. A key inside the consume
+    // because 2.8.0 to 2.11.0, which refresh a project with their own
+    // validator, pass one there and refuse a new top-level key.
+    cited?: boolean;
   }>;
   requires_stage: string[];
   sensors?: string[];
@@ -637,7 +642,7 @@ export function validateStageFrontmatter(
     }
   }
 
-  // Rule 8: nested consumes[] — array of {artifact, required, conditional_on?}.
+  // Rule 8: nested consumes[], an array of {artifact, required, conditional_on?, cited?}.
   if ("consumes" in o) {
     const consumesVal = o.consumes;
     if (!Array.isArray(consumesVal)) {
@@ -677,6 +682,10 @@ export function validateStageFrontmatter(
               `consumes[${i}].conditional_on must be one of ${VALID_CONDITIONAL_ON.join(" | ")}, got "${e.conditional_on}"`
             );
           }
+        }
+
+        if ("cited" in e && e.cited !== undefined && typeof e.cited !== "boolean") {
+          errors.push(`consumes[${i}].cited must be boolean, got ${describe(e.cited)}`);
         }
       });
     }

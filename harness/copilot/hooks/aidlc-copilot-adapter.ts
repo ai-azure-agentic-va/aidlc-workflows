@@ -3,7 +3,8 @@
 // file; the aidlc-*.ts hook bodies beside it are PACKAGED core, byte-shared
 // with the Claude Code harness). Modeled on codex's aidlc-codex-adapter.ts:
 // ONE shim normalizes the harness payload to the ClaudeCodeHookInput shape
-// and subprocess-pipes into the named core hook, forwarding the result.
+// and hands it to the named core hook, forwarding the result. The four guards
+// run theirs inside this process (runGuard); the other hooks run as children.
 //
 // ONE dist serves BOTH Copilot surfaces (CLI 1.0.74+ and VS Code agent mode
 // 1.130+): the shipped .github/hooks/aidlc.json registers PascalCase event
@@ -100,6 +101,8 @@ import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep 
 import { fileURLToPath } from "node:url";
 import {
   beforeDelimiter,
+  decideFence,
+  ENGINE_OWNED_STATE_TRANSITIONS,
   workflowParticipation,
   hookStandsOutside,
   enterHookWorkflow,
@@ -119,6 +122,7 @@ import {
   recordPreWorkflowHeartbeat,
   resolveWorkflowSelection,
   noteHelperSession,
+  runHookHere,
   settleCopilotCommand,
   settleCopilotIntentBoundary,
   stateFilePath,
@@ -247,12 +251,14 @@ export async function run(
   // engine is told nothing and treats the call as it treats a command with no
   // chat, instead of binding a new "chat" for every tool call.
   const coreSessionId = sessionId.startsWith("toolu_") ? "" : sessionId;
-  const projectEnv = {
-    ...process.env,
+  // What a core hook is given on top of this process's environment, as a
+  // child or (runGuard) while it runs here.
+  const projectPins: Record<string, string> = {
     AIDLC_PROJECT_DIR: projectDir,
     CLAUDE_PROJECT_DIR: projectDir,
     ...(sessionId ? { AIDLC_COPILOT_SESSION_ID: sessionId } : {}),
   };
+  const projectEnv = { ...process.env, ...projectPins };
 
   // Tolerant field reads: PascalCase-registered events arrive snake_case on
   // both surfaces EXCEPT SubagentStart, which the CLI delivers camelCase
@@ -408,6 +414,22 @@ export async function run(
     };
   }
 
+  // The four guards run their core hook inside this process, as on Codex: a
+  // child loads the whole engine again, so as children the four would cost a
+  // shell call five engine loads. A guard sees what its child saw (the same input and pins);
+  // one that cannot be imported runs as a child as before, and one that fails
+  // on its own still leaves its reason where doctor reads it.
+  async function runGuard(
+    hookFile: string,
+    stdin: string,
+  ): Promise<{ stdout: string; stderr: string; code: number }> {
+    const here = await runHookHere(join(HOOKS_DIR, hookFile), stdin, projectPins);
+    if (here === null) return runCoreWithStderr(hookFile, stdin);
+    const hook = hookFile.replace(/^aidlc-|\.ts$/g, "");
+    failedCoreHookDrop(hook, here.code, null, here.stderr, forwardedSessionId(stdin));
+    return here;
+  }
+
   // The session a core hook ran for: the forwarded payload's (the prior
   // session for a reconciled session-end), else this event's.
   function forwardedSessionId(stdin: string): string {
@@ -434,7 +456,7 @@ export async function run(
   ): void {
     if (exitCode === 0 || exitCode === 2) return;
     const lines = stderr.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
-    const line = (lines.find((entry) => entry.startsWith("error:")) ??
+    const line = (lines.find((entry) => /^(?:\w*Error|error):/.test(entry)) ??
       lines.filter((entry) => !/^Bun v\d/.test(entry)).at(-1) ?? "no error output")
       .replace(/\[(degraded|advisory)\]/gi, "($1)");
     const how = exitCode === null ? `was stopped by ${signalCode ?? "a signal"}` : `exited ${exitCode}`;
@@ -569,12 +591,23 @@ export async function run(
   // The person's words in a recorded answer or decision are text, never a
   // path: on Windows `--options "A: yes,B: no"` would read as drive A:.
   const FREE_TEXT_FLAGS = new Set(["--options", "--details", "--decision", "--reason"]);
-  function withoutFreeText(args: readonly string[]): string[] {
+  // So are the words a setter is handed as the reply that asked for it
+  // (`--person-words '/aidlc turn the review freeze off'`), on the commands
+  // that take them and can run without a click (`scope change` always keeps
+  // the prompt), outside a Windows terminal (PowerShell, cmd, or a call that
+  // names no shell on Windows), where they are checked as any other argument;
+  // the file form, --person-words-file, is always a path.
+  const PERSON_WORDS_FLAGS = new Set(["--person-words"]);
+  const TAKES_PERSON_WORDS = new Set(["config set", "intent create", "top-recompose recompose"]);
+  // A value is the next argument only when it does not start with `--`, as
+  // parseArgs and the log reader take it (recompose refuses a value starting
+  // with `-`), so no flag after it is hidden.
+  function withoutFreeText(args: readonly string[], flags: ReadonlySet<string> = FREE_TEXT_FLAGS): string[] {
     const kept: string[] = [];
     for (let i = 0; i < args.length; i++) {
       if (args[i] === "--") { kept.push(...args.slice(i)); break; }
-      if (!FREE_TEXT_FLAGS.has(args[i].split("=")[0])) kept.push(args[i]);
-      else if (!args[i].includes("=")) i++;
+      if (!flags.has(args[i].split("=")[0])) kept.push(args[i]);
+      else if (!args[i].includes("=") && args[i + 1] !== undefined && !args[i + 1].startsWith("--")) i++;
     }
     return kept;
   }
@@ -664,9 +697,10 @@ export async function run(
     const at = route.group === "top" ? (clean[0] === "engine" ? 0 : -1) : clean.indexOf(route.group);
     const rest = clean.slice(at + 2);
     const recordsWords = route.id === "log" && (clean[at + 1] === "answer" || clean[at + 1] === "decision");
+    const takesWords = !windowsTerminal && TAKES_PERSON_WORDS.has(`${route.id} ${clean[at + 1]}`);
     return !keepsPrompt(route.id, clean[at + 1] ?? "", rest, personMayLift) &&
       !clean.some((arg) => CALLER_RUNS.has(arg.split("=")[0])) &&
-      argumentsStayInProject(recordsWords ? withoutFreeText(clean) : clean);
+      argumentsStayInProject(recordsWords ? withoutFreeText(clean) : takesWords ? withoutFreeText(clean, PERSON_WORDS_FLAGS) : clean);
   }
 
   function personActedSinceGate(): boolean {
@@ -682,13 +716,24 @@ export async function run(
     return beforeDelimiter(args).some((arg) => arg === flag || arg.startsWith(`${flag}=`));
   }
 
-  // Stage status changes the state-transition guard refuses, plus the setters
-  // that change how many approval gates the person sees.
-  const STATE_KEEPS_PROMPT = new Set([
-    "set", "checkbox", "advance", "finalize", "complete-workflow", "gate-start", "approve", "reject",
-    "revise", "skip", "park", "refresh-unit-progress", "fold-unit-merge",
-    "set-unit-gate-rhythm", "set-construction-checkpoints", "set-skeleton-stance",
-  ]);
+  // The setters that change how many approval gates the person sees.
+  const GATE_SETTERS_KEEP_PROMPT = new Set(["set-unit-gate-rhythm", "set-construction-checkpoints", "set-skeleton-stance"]);
+
+  // A stage-status change only the engine makes lands when the state-transition
+  // check stands aside for this chat's work. While the check holds, the state
+  // tool refuses it with its own words, so there is nothing to ask. Read
+  // through the same decision the state tool makes; anything unread keeps the
+  // prompt.
+  function stateTransitionStandsAside(): boolean {
+    const workflow = enterHookWorkflow(projectDir, sessionId);
+    try {
+      return decideFence(projectDir, "state-transition").decision === "stand-aside";
+    } catch {
+      return true;
+    } finally {
+      workflow.restore();
+    }
+  }
 
   // Commands that keep the host's Allow prompt, so the person sees each one
   // before it runs: they throw away or merge the person's work, change which
@@ -741,7 +786,8 @@ export async function run(
       case "state-passthrough":
         if (verb === "set-construction-checkpoints" && rest.length === 1 &&
           constructionPolicyChangeAllowed(projectDir, "Construction Checkpoints", rest[0])) return false;
-        return STATE_KEEPS_PROMPT.has(verb);
+        if (ENGINE_OWNED_STATE_TRANSITIONS.has(verb)) return stateTransitionStandsAside();
+        return GATE_SETTERS_KEEP_PROMPT.has(verb);
       case "state-utility": return verb === "set-status";
       // Aborting a Bolt needs the person's consent, discarded or not.
       case "bolt": return verb === "set-autonomy" || verb === "abort";
@@ -1978,7 +2024,7 @@ export async function run(
             // Malformed advisory output does not disable plan enforcement.
           }
         }
-        const planApproval = runCoreWithStderr(
+        const planApproval = await runGuard(
           "aidlc-plan-approval-guard.ts",
           JSON.stringify({
             hook_event_name: "PreToolUse",
@@ -2018,7 +2064,7 @@ export async function run(
           process.stdout.write(denyJson("This AI-DLC command targets a different physical project. Run it from that project's own Copilot session."));
           return 0;
         }
-        const guard = runCoreWithStderr(
+        const guard = await runGuard(
           "aidlc-state-transition-guard.ts",
           withAgentType(canonicalInput, delegatedAgentType()),
         );
@@ -2026,7 +2072,7 @@ export async function run(
           process.stdout.write(denyJson(guard.stderr));
           return 0;
         }
-        const scope = runCoreWithStderr(
+        const scope = await runGuard(
           "aidlc-reviewer-scope.ts",
           withAgentType(canonicalInput),
         );
@@ -2034,7 +2080,7 @@ export async function run(
           process.stdout.write(denyJson(scope.stderr));
           return 0;
         }
-        const freeze = runCoreWithStderr(
+        const freeze = await runGuard(
           "aidlc-review-freeze.ts",
           canonicalInput,
         );
@@ -2042,7 +2088,7 @@ export async function run(
           process.stdout.write(denyJson(freeze.stderr));
           return 0;
         }
-        const planApproval = runCoreWithStderr(
+        const planApproval = await runGuard(
           "aidlc-plan-approval-guard.ts",
           withShellReading(canonicalInput),
         );
@@ -2193,7 +2239,7 @@ export async function run(
             tool_input: call.toolInput,
             ...(agentType ? { agent_type: agentType } : {}),
           });
-          const r = runCoreWithStderr("aidlc-reviewer-scope.ts", fwd);
+          const r = await runGuard("aidlc-reviewer-scope.ts", fwd);
           if (r.code === 2) {
             process.stdout.write(denyJson(r.stderr));
             return 0;
@@ -2201,7 +2247,7 @@ export async function run(
         }
         for (const call of toolCalls) {
           if (call.toolName === "Write" || call.toolName === "Edit") {
-            const freeze = runCoreWithStderr(
+            const freeze = await runGuard(
               "aidlc-review-freeze.ts",
               JSON.stringify({
                 hook_event_name: "PreToolUse",
@@ -2213,7 +2259,7 @@ export async function run(
               process.stdout.write(denyJson(freeze.stderr));
               return 0;
             }
-            const planApproval = runCoreWithStderr(
+            const planApproval = await runGuard(
               "aidlc-plan-approval-guard.ts",
               JSON.stringify({
                 hook_event_name: "PreToolUse",

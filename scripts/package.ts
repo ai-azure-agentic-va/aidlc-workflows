@@ -69,6 +69,7 @@ import {
 } from "./agent-knowledge.ts";
 import { renderNeutralOnboarding, renderOnboarding } from "./onboarding.ts";
 import { keepOwnHarnessBindings } from "./harness-bindings.ts";
+import { EARLIER_RELEASE_REGIONS, earlierReleasesReadSkill } from "./earlier-release-regions.ts";
 import { forgetPackagedSources, packageInputsFingerprint, recordPackagedSources } from "./package-sources.ts";
 import {
   buildPluginProjection as emitPluginProjection,
@@ -100,7 +101,7 @@ import {
 import { copyChannelDispatcherCommands, copyChannelToolScripts, ROUTES, TOOLS } from "../core/tools/aidlc.ts";
 import { AIDLC_VERSION } from "../core/tools/aidlc-version.ts";
 import { BUILD_VERSION_ENV, releaseBuildVersion } from "../core/tools/aidlc-channel.ts";
-import { copyStartsWithout, sha256Bytes, writtenRootIntegration } from "../core/tools/aidlc-distribution.ts";
+import { copyStartsWithout, harnessChoiceTextIsPlain, sha256Bytes, writtenRootIntegration } from "../core/tools/aidlc-distribution.ts";
 import { kiroIdeSteering } from "../core/tools/aidlc-includes.ts";
 import { SHIPPED_FORMAT_DOCS } from "../core/tools/aidlc-inline-context.ts";
 import { AIDLC_SETTINGS_SCHEMA } from "../core/tools/aidlc-settings.ts";
@@ -626,6 +627,9 @@ function writeSettingsSchemaData(treeRoot: string): void {
 }
 
 function writeProjectionData(outRoot: string, treeRoot: string, m: HarnessManifest): void {
+  if (!harnessChoiceTextIsPlain(m)) {
+    throw new Error(`[${m.name}] choiceName or choiceNote is not text the harness lists can show`);
+  }
   const rootIntegrationPaths = new Set(m.rootIntegrations.map((item) => item.path));
   if (rootIntegrationPaths.size !== m.rootIntegrations.length) {
     throw new Error(`[${m.name}] duplicate root integration path`);
@@ -705,6 +709,8 @@ function writeProjectionData(outRoot: string, treeRoot: string, m: HarnessManife
     schemaVersion: 1,
     distribution: m.name,
     productName: m.productName,
+    ...(m.choiceName ? { choiceName: m.choiceName } : {}),
+    ...(m.choiceNote ? { choiceNote: m.choiceNote } : {}),
     configNextStep: m.configNextStep,
     ...(m.firstRunSteps ? { firstRunSteps: m.firstRunSteps } : {}),
     ...(m.editorTerminalApp ? { editorTerminalApp: m.editorTerminalApp } : {}),
@@ -1050,6 +1056,8 @@ function buildTree(
   //    them only after emit(), because Codex and Copilot place the orchestrator
   //    skill outside <harnessDir>/skills/.
   refreshGeneratedSkillRegions(outRoot, treeRoot, harnessDir, m);
+  // 7. The place an earlier release's refresh writes the tables into the skill.
+  keepEarlierReleaseRegions(outRoot, m);
   return [...walk(outRoot)];
 }
 
@@ -1343,6 +1351,24 @@ function rewriteNativeOnboarding(value: string, exactReads = false): string {
     );
 }
 
+// A copyOnly harness file ships in the copy runtime alone. The native tree
+// drops it and the root integration of the same path, so `aidlc config` never
+// writes it into a project.
+function dropCopyOnlyFiles(outRoot: string, m: HarnessManifest): void {
+  const copyOnly = m.harnessFiles.filter((file) => file.copyOnly);
+  if (copyOnly.length === 0) return;
+  for (const file of copyOnly) {
+    rmSync(file.projectRoot ? join(outRoot, file.dst) : join(outRoot, m.harnessDir, file.dst), { force: true });
+  }
+  const dropped = new Set(copyOnly.filter((file) => file.projectRoot).map((file) => file.dst));
+  const descriptorPath = join(outRoot, m.harnessDir, PROJECTION_DATA);
+  const descriptor = JSON.parse(readFileSync(descriptorPath, "utf-8")) as {
+    rootIntegrations: Array<Record<string, unknown>>;
+  };
+  descriptor.rootIntegrations = descriptor.rootIntegrations.filter((item) => !dropped.has(String(item.path)));
+  writeFileSync(descriptorPath, `${JSON.stringify(descriptor, null, 2)}\n`);
+}
+
 function projectNativeRootIntegrations(outRoot: string, m: HarnessManifest): void {
   const additions = m.nativeRootIntegrations ?? [];
   if (additions.length === 0) return;
@@ -1389,6 +1415,7 @@ function rewriteNativeInvocations(
   m: HarnessManifest,
   copyRoot: string,
 ): void {
+  dropCopyOnlyFiles(outRoot, m);
   projectNativeRootIntegrations(outRoot, m);
   applyNativeReplacements(outRoot, m);
   const harnessDir = escapeRegExp(m.harnessDir);
@@ -1694,6 +1721,14 @@ function refreshGeneratedSkillRegions(
   }
 
   writeFileSync(skillPath, body, "utf-8");
+}
+
+// See scripts/earlier-release-regions.ts.
+function keepEarlierReleaseRegions(outRoot: string, manifest: HarnessManifest): void {
+  const skillPath = assembledOrchestratorSkill(outRoot, manifest);
+  if (!earlierReleasesReadSkill(relative(outRoot, skillPath), manifest.harnessDir)) return;
+  const body = readFileSync(skillPath, "utf-8").replace(/\n*$/, "");
+  writeFileSync(skillPath, `${body}\n\n${EARLIER_RELEASE_REGIONS}\n`, "utf-8");
 }
 
 // Defense-in-depth backstop: rewrite any residual "<harnessDir>/rules/" →

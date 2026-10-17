@@ -4,7 +4,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { accessSync, chmodSync, closeSync, constants as fsConstants, cpSync, type Dirent, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, opendirSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve as resolvePath, sep, win32 } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { TextDecoder } from "node:util";
 import { inflateSync } from "node:zlib";
 import { dlopen, FFIType, type Pointer } from "bun:ffi";
@@ -427,7 +427,12 @@ export interface HookActivation {
 
 interface ShippedHarnessData {
   rulesSubdir: string | null;
+  /** The plugins the person selected, as typed; null when there is no selection. */
   plugins: ReadonlySet<string> | null;
+  /** Selected plugins paused because their base is off, each with its base. */
+  paused: ReadonlyMap<string, string>;
+  /** The plugins that run: the selection less the paused ones. */
+  active: ReadonlySet<string> | null;
   documentExtractors: ReadonlyMap<string, DocumentExtractorSpec> | null;
   runnerFrontmatterAdditions: readonly string[];
   hookActivation: HookActivation | null;
@@ -619,9 +624,14 @@ function readShippedHarnessData(): ShippedHarnessData {
         finish.every((name) => typeof name === "string" && name !== "")
       ? [...finish as string[]]
       : null;
+    const paused = pausedBySelection(plugins, (plugin) => composedPluginBase(dirname(p), plugin));
     _shippedHarnessData = {
       rulesSubdir,
       plugins,
+      paused,
+      active: plugins === null || paused.size === 0
+        ? plugins
+        : new Set([...plugins].filter((plugin) => !paused.has(plugin))),
       documentExtractors,
       runnerFrontmatterAdditions,
       hookActivation,
@@ -635,6 +645,8 @@ function readShippedHarnessData(): ShippedHarnessData {
   _shippedHarnessData = {
     rulesSubdir: null,
     plugins: null,
+    paused: new Map(),
+    active: null,
     documentExtractors: null,
     runnerFrontmatterAdditions: [],
     hookActivation: null,
@@ -678,8 +690,59 @@ export function documentExtractors(): ReadonlyMap<string, DocumentExtractorSpec>
   return readShippedHarnessData().documentExtractors;
 }
 
+/** The plugins that run: the person's selection less the plugins paused
+ *  because their base is off. Null when there is no selection (all run). */
 export function pluginsEnabled(): ReadonlySet<string> | null {
+  return readShippedHarnessData().active;
+}
+
+/** The person's selection exactly as they typed it, for showing it back. */
+export function pluginsSelected(): ReadonlySet<string> | null {
   return readShippedHarnessData().plugins;
+}
+
+/** Selected plugins paused because their base is off, each with its base. */
+export function pausedPlugins(): ReadonlyMap<string, string> {
+  return readShippedHarnessData().paused;
+}
+
+// A plugin builds on core and at most one base plugin. When the person's
+// selection keeps a plugin but leaves its base out, that plugin stays in their
+// list and is paused: nothing it adds runs until the base is on again. The one
+// owner of that rule; the base comes from the plugin's composition stamp,
+// which plugin sync writes.
+export function pausedBySelection(
+  selection: ReadonlySet<string> | null,
+  baseOf: (plugin: string) => string | null,
+): Map<string, string> {
+  const paused = new Map<string, string>();
+  if (selection === null) return paused;
+  for (const plugin of [...selection].sort()) {
+    if (plugin === "aidlc") continue;
+    const base = baseOf(plugin);
+    if (base !== null && !selection.has(base)) paused.set(plugin, base);
+  }
+  return paused;
+}
+
+/** The one line a selection change says, once, when it pauses `plugin`;
+ *  `offCommand` turns the plugin off as well, or null when no list is left. */
+export function pausedLine(plugin: string, base: string, offCommand: string | null): string {
+  return `${base} is off. ${plugin} builds on ${base}, so ${plugin} is paused until ${base} is on again. ` +
+    (offCommand === null
+      ? `To turn ${plugin} off as well, select the plugins you want on.`
+      : `To turn ${plugin} off as well: ${offCommand}.`);
+}
+
+/** The base a composed plugin builds on, from its stamp in `dataDir`. */
+export function composedPluginBase(dataDir: string, plugin: string): string | null {
+  if (!/^[a-z][a-z0-9-]*$/.test(plugin)) return null;
+  try {
+    const base = (JSON.parse(readFileSync(join(dataDir, `plugin-compose-${plugin}.json`), "utf-8")) as { base?: unknown }).base;
+    return typeof base === "string" && /^[a-z][a-z0-9-]*$/.test(base) ? base : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1032,8 +1095,9 @@ export function isRetiredOnlyNextArgv(args: readonly string[]): boolean {
 }
 
 // A next made only of modifier flags, one of whose values parseNextFlags refuses
-// (a depth, test-strategy, review, Guard Policy or ceremony word it does not
-// accept, or a missing value), returns that refusal before naming any command.
+// (a depth, test-strategy, review, Guard Policy, ceremony or switchable
+// `--guard.<check>` word it does not accept, or a missing value), returns that
+// refusal before naming any command.
 // It is terminal, not workflow engagement (t-tui-t27, Full Suite 36549553601).
 // A flag that takes no value beside them (`--resume`, which the agent adds on a
 // re-entry, `--single`, `--new-intent`, ...: the `none` shapes in NEXT_FLAGS)
@@ -1055,7 +1119,9 @@ export function isRefusedModifierNextArgv(args: readonly string[]): boolean {
       ? ["adversarial", "advisory", "none"]
       : flag === "--depth" || flag === "--test-strategy"
         ? ["minimal", "standard", "comprehensive"]
-        : null;
+        : flag.startsWith("--") && guardFenceFromConfigKey(flag.slice(2)) !== null
+          ? ["on", "off"]
+          : null;
     if (!words && !ceremony && !guard) return false;
     const value = args[i + 1];
     if (value === undefined || value.startsWith("--")) {
@@ -2302,6 +2368,19 @@ export function fenceCommandOutput(output: string, exitCode?: number): string {
   );
 }
 
+// What a prompt hook hands the agent with a command it already ran for the
+// person's own line (`command`, as they typed it): the output to show them,
+// and that nothing else is to run this turn. One wording for every host whose
+// prompt hook does this (the core human-turn hook, both Kiro adapters).
+export function terminalCommandRelay(command: string, output: string, exitCode?: number): string {
+  return (
+    `The command \`${command}\` has already run; it carries no workflow work. ` +
+    `Relay the output below to the person ${relayAsTextBlock(output)}, then stop. ` +
+    "Run no shell command and no AI-DLC command this turn, and do not advance, resume, or run any workflow stage.\n\n" +
+    fenceCommandOutput(output, exitCode)
+  );
+}
+
 // --- Engine command detectors (hook classifier seam) ---
 //
 // These raw command-string classifiers are shared by hooks and tests. They do
@@ -2722,9 +2801,11 @@ function isTerminalUtilityNext(invocation: { command: string; args: string[] }):
 // slot, and says what fills it, for the agent to put the reply that asked there.
 export const PERSON_WORDS_SLOT = "<their words>";
 export const PERSON_WORDS_FILL = `, with ${PERSON_WORDS_SLOT} the person's reply that asked for it, word for word`;
-const CONFIGURATION_STEP = new RegExp(
-  `^Run \`([^\`]+)\` to update the configuration(${escapeRegex(PERSON_WORDS_FILL)})?, then print its output verbatim and stop\\.$`,
+const dispatchStep = (doing: string): RegExp => new RegExp(
+  `^Run \`([^\`]+)\` to ${doing}(${escapeRegex(PERSON_WORDS_FILL)})?, then print its output verbatim and stop\\.$`,
 );
+const CONFIGURATION_STEP = dispatchStep("update the configuration");
+const SCOPE_CHANGE_STEP = dispatchStep("change scope");
 
 // A modifier-only next, or one naming a scope, can initialize work or dispatch
 // configuration or a scope change depending on state. Its own successful
@@ -2760,8 +2841,13 @@ function isTerminalConfigurationDispatch(
     "--guard-policy": "guard-policy",
     "--change-control": "guard-policy",
     ...Object.fromEntries(CEREMONY_KEYS.map((key) => [CEREMONY_FLAGS[key], CEREMONY_FLAGS[key].slice(2)])),
+    // A check typed for this work; `guard.plan-approval` is another way to say plan approval.
+    ...Object.fromEntries(SWITCHABLE_GUARD_FENCES.map((fence) =>
+      [`--guard.${fence}`, fence === "plan-approval" ? "plan-approval" : `guard.${fence}`]
+    )),
   };
-  const order = ["depth", "test-strategy", "review", "guard-policy", ...CEREMONY_KEYS.map((key) => CEREMONY_FLAGS[key].slice(2))];
+  const fences = SWITCHABLE_GUARD_FENCES.filter((fence) => fence !== "plan-approval").map((fence) => `guard.${fence}`);
+  const order = ["depth", "test-strategy", "review", "guard-policy", ...CEREMONY_KEYS.map((key) => CEREMONY_FLAGS[key].slice(2)), ...fences];
   const values = new Map<string, string>();
   // A scope change names its own command, carrying any setting typed with it.
   let scope: string | undefined;
@@ -2773,10 +2859,12 @@ function isTerminalConfigurationDispatch(
     const name = modifierFlags[args[i]];
     if (name === undefined || values.has(name)) return false;
     // The engine names the parsed value: the guard policy and ceremony words,
-    // and the depth, test-strategy, and review words lowercased (it refuses
-    // any other word before naming a command).
+    // and the depth, test-strategy, review, and check words lowercased (it
+    // refuses any other word before naming a command).
     const raw = args[i + 1];
-    const levels = name === "review" ? ["adversarial", "advisory", "none"] : ["minimal", "standard", "comprehensive"];
+    const levels = name === "review"
+      ? ["adversarial", "advisory", "none"]
+      : args[i].startsWith("--guard.") ? ["on", "off"] : ["minimal", "standard", "comprehensive"];
     const value = name === "guard-policy"
       ? parseGuardPolicy(raw)
       : CEREMONY_KEYS.some((key) => CEREMONY_FLAGS[key] === args[i])
@@ -2807,7 +2895,7 @@ function isTerminalConfigurationDispatch(
     const validated = validateDirective(parsed);
     if (!validated.valid || validated.data.kind !== "print") return false;
     const match = (scope !== undefined
-      ? /^Run `([^`]+)` to change scope, then print its output verbatim and stop\.$/
+      ? SCOPE_CHANGE_STEP
       : CONFIGURATION_STEP).exec(validated.data.message);
     if (!match) return false;
     if (match[2] !== undefined) expected.push("--person-words", PERSON_WORDS_SLOT);
@@ -3668,11 +3756,7 @@ export function codekbScopeFingerprint(
   excludedPaths: string[] = [],
 ): string | null {
   if (paths.length === 0) return null;
-  const normalizePath = (path: string): string => {
-    let normalized = path.replaceAll("\\", "/");
-    normalized = normalized.replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
-    return normalized === "." ? "" : normalized;
-  };
+  const normalizePath = (path: string): string => normalizeScopePath(path.replaceAll("\\", "/"));
   const normalizedExclusions = excludedPaths.map(normalizePath);
   const survivingPaths = paths
     .map((original) => ({ original, normalized: normalizePath(original) }))
@@ -4111,14 +4195,29 @@ export function codekbStoreIsCurrent(
   return current !== null && current === parsed.scope.fingerprint;
 }
 
-// Coverage test for the compare mode: does the incoming run's analyzed set
-// cover a store entry? Literal match, or an incoming DIRECTORY prefix (entry
-// ending "/") subsuming the store path. Deliberately prefix-only - scope
-// paths are authored as repo-relative dirs/files, not globs.
+// One spelling of a scope path for comparing: a leading "./" and a trailing "/" go, and
+// the repo root ("." or "./") becomes "". `a`, `a/` and `./a/` name the same entry. A
+// backslash is left alone: the source fingerprint turns a backslash into / before it calls
+// this; nothing else does.
+export function normalizeScopePath(path: string): string {
+  const normalized = path.replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
+  return normalized === "." ? "" : normalized;
+}
+
+// Coverage test for publish and the compare mode: does the incoming run's
+// analyzed set cover a store entry? The same path in either spelling (a trailing
+// slash or a leading "./" does not change what it names), or an incoming
+// DIRECTORY (entry ending "/") subsuming the store path. A path written without
+// the slash covers only itself. Whether a path exists, or is a file or a
+// directory, is the source fingerprint's to say, not this test's. Deliberately
+// prefix-only - scope paths are authored as repo-relative dirs/files, not globs -
+// and a prefix ends at a "/", so `a/` never covers `a.txt`.
 export function scopePathCovered(incoming: string[], storePath: string): boolean {
-  return incoming.some(
-    (p) => p === storePath || (p.endsWith("/") && storePath.startsWith(p)),
-  );
+  const store = normalizeScopePath(storePath);
+  return incoming.some((p) => {
+    const covering = normalizeScopePath(p);
+    return covering === store || (covering !== "" && p.endsWith("/") && store.startsWith(`${covering}/`));
+  });
 }
 
 // The bare SPACE record root: `aidlc/spaces/<space>/intents/`. The absolute path
@@ -4553,18 +4652,49 @@ export function workToPickUp(
 ): Array<{ intent: IntentInfo; state: string }> | null {
   const recorded = listIntents(projectDir, space, selectedIntent).filter((intent) => !isArchivedIntent(intent));
   if (recorded.length === 0 || recorded.some((intent) => intent.active)) return null;
-  const unfinished = recorded.map((intent) => {
-    let state = "";
-    if (intent.dirName) {
-      try {
-        state = readFileSync(stateFilePath(projectDir, intent.dirName, space), "utf-8");
-      } catch {
-        // Registry-only or incomplete record: leave unannotated.
-      }
-    }
-    return { intent, state };
-  }).filter(({ intent, state }) => !isCompletedIntent(intent) && getField(state, "Status") !== "Completed");
+  const unfinished = recorded.map((intent) => ({ intent, state: recordStateText(projectDir, intent, space) }))
+    .filter(({ intent, state }) => !isFinishedWork(intent, state));
   return unfinished.some(({ intent }) => intent.dirName) ? unfinished : null;
+}
+
+/**
+ * The finished work in `space` whose record is in this checkout, archived work
+ * left out: what words on finished work may ask to go back to. The same
+ * finished test as `workToPickUp`, which leaves this work out.
+ */
+export function finishedWork(projectDir: string, space: string, selectedIntent: string | null): IntentInfo[] {
+  return listIntents(projectDir, space, selectedIntent)
+    .filter((intent) => intent.dirName !== null && !isArchivedIntent(intent))
+    .filter((intent) => isFinishedWork(intent, recordStateText(projectDir, intent, space)));
+}
+
+/**
+ * Where a piece of work stands, in the stage names the person sees: "at
+ * <stage>", or "in <Phase>" for work going Unit by Unit, whose Current Stage
+ * stays on the first per-Unit stage while each Unit works through the later
+ * ones. Empty when the state names no known stage.
+ */
+export function workStanding(state: string): string {
+  const stage = findStageBySlug((getField(state, "Current Stage") ?? "").trim());
+  if (!stage) return "";
+  const unitByUnit = isPerUnitStage(stage) && getField(state, "Construction Iteration")?.trim() === "unit-major";
+  return unitByUnit ? `in ${stage.phase.charAt(0).toUpperCase()}${stage.phase.slice(1)}` : `at ${stage.name}`;
+}
+
+// Either signal marks work finished: the registry row, or the state file a
+// finalize completed.
+function isFinishedWork(intent: IntentInfo, state: string): boolean {
+  return isCompletedIntent(intent) || getField(state, "Status") === "Completed";
+}
+
+function recordStateText(projectDir: string, intent: IntentInfo, space: string): string {
+  if (!intent.dirName) return "";
+  try {
+    return readFileSync(stateFilePath(projectDir, intent.dirName, space), "utf-8");
+  } catch {
+    // Registry-only or incomplete record: leave unannotated.
+    return "";
+  }
 }
 
 export function listIntents(
@@ -6748,12 +6878,11 @@ export function reviewCheckOffer(
       : [...new Set(attempt.filter((event) => event.event === "REVIEW_COMPLETED")
         .map((event) => auditBlockField(event.block, "Unit") ?? undefined))];
     for (const each of units) {
-      const mine = attempt.filter((event) => (auditBlockField(event.block, "Unit") ?? undefined) === each);
-      const review = mine.filter((event) => event.event === "REVIEW_COMPLETED").at(-1);
-      const change = mine.filter((event) =>
-        event.event === "CHANGE_ACCEPTED" && auditBlockField(event.block, "Checkpoint") === "review-receipt" &&
+      const reviewed = attempt.some((event) =>
+        event.event === "REVIEW_COMPLETED" && (auditBlockField(event.block, "Unit") ?? undefined) === each);
+      const change = changesSinceLastReview(projectDir, attempt, stage.slug, each).filter((event) =>
         ![null, "", "(paths unavailable)"].includes(auditBlockField(event.block, "Changed"))).at(-1);
-      if (!review || !change || !attemptEventDefinitelyBefore(review, change)) continue;
+      if (!reviewed || !change) continue;
       const used = reviewAttemptAccounting(
         projectDir, reviewAttemptWindow(projectDir, state, stage, rows), state, stage, stage.reviewer, each, undefined,
         { eventFilter: (row) => reviewAttemptEventMatchesCurrentClaim(projectDir, state, each, row) },
@@ -6764,6 +6893,25 @@ export function reviewCheckOffer(
     return null;
   }
   return null;
+}
+
+// The kept changes to a stage's reviewed work (its CHANGE_ACCEPTED rows at the
+// review receipt), for one Unit or for the stage itself, that came after the
+// latest finished review of the same work: what no review has seen. A review
+// that did not finish saw nothing. `events` are the attempt's rows, in order.
+export function changesSinceLastReview(
+  projectDir: string,
+  events: ReadonlyArray<AuditShardEvent>,
+  stage: string,
+  unit: string | undefined,
+): AuditShardEvent[] {
+  const mine = events.filter((event) =>
+    auditBlockField(event.block, "Stage") === stage && (auditBlockField(event.block, "Unit") ?? undefined) === unit);
+  const review = mine.filter((event) =>
+    event.event === "REVIEW_COMPLETED" && !reviewCompletionDidNotFinish(projectDir, event.block)).at(-1);
+  return mine.filter((event) =>
+    event.event === "CHANGE_ACCEPTED" && auditBlockField(event.block, "Checkpoint") === "review-receipt" &&
+    (review === undefined || attemptEventDefinitelyBefore(review, event)));
 }
 
 // What the person hears about a finished stage that is behind something it
@@ -7590,7 +7738,12 @@ export function workflowParticipation(
 export function enterHookWorkflow(
   projectDir: string,
   payloadSessionId: unknown,
-): { selection: WorkflowSelection | null; participation: WorkflowParticipation; restore: () => void } {
+): {
+  selection: WorkflowSelection | null;
+  participation: WorkflowParticipation;
+  projectDir: string;
+  restore: () => void;
+} {
   const raw = typeof payloadSessionId === "string" ? validSessionId(payloadSessionId) : null;
   const chat = raw === null ? null : resolveChat(projectDir, raw, { bind: false });
   // Placed: this chat has a binding, or the id belongs to a chat an adapter named.
@@ -7612,34 +7765,66 @@ export function enterHookWorkflow(
   }
   try {
     const selection = resolveWorkflowSelection(projectDir);
-    return { selection, participation: workflowParticipation(projectDir, selection), restore };
+    return {
+      selection,
+      participation: workflowParticipation(projectDir, selection),
+      projectDir,
+      restore,
+    };
   } catch {
-    return { selection: null, participation: "indeterminate", restore };
+    return { selection: null, participation: "indeterminate", projectDir, restore };
   }
 }
 
-// A hook stands outside when its selection names a record this conversation has
-// not joined, or when participation cannot be decided. Hooks that only write into
-// the record skip on it. A selection with no record (a cold workspace) is not
-// "outside": there is nothing to protect, and hooks keep their pre-workflow
-// behaviour.
-export function hookStandsOutside(workflow: ReturnType<typeof enterHookWorkflow>): boolean {
+// This conversation has not joined the selected record, or participation cannot
+// be decided. A selection with no record (a cold workspace) has not failed to
+// join one: there is nothing to protect.
+function conversationHasNotJoined(workflow: ReturnType<typeof enterHookWorkflow>): boolean {
   if (workflow.selection === null) return true;
   if (workflow.selection.intent !== null) return workflow.participation !== "participant";
   // Bound to no record because the record it found was not joined: still outside
   // that record, unlike a session in a workspace that has none.
-  const source = workflow.selection.binding?.source;
-  return source === "unjoined";
+  return workflow.selection.binding?.source === "unjoined";
+}
+
+// The selected record's own Status. Completed and Archived are finished work:
+// the conversation may still be the one that did it, and the record stays
+// selected, but a later chat event is not part of that work.
+export function selectedRecordIsFinished(
+  projectDir: string,
+  selection: WorkflowSelection | null,
+): boolean {
+  if (!projectDir || selection === null) return false;
+  let content: string;
+  try {
+    content = readFileSync(stateFilePathForSelection(projectDir, selection), "utf-8");
+  } catch {
+    return false;
+  }
+  const status = getField(content, "Status");
+  return status === "Completed" || status === "Archived";
+}
+
+// A hook stands outside when its selection names a record this conversation has
+// not joined, when participation cannot be decided, or when that record is
+// finished (Completed or Archived). Hooks that only write into the record skip
+// on it. A selection with no record (a cold workspace) is not "outside": there
+// is nothing to protect, and hooks keep their pre-workflow behaviour.
+export function hookStandsOutside(workflow: ReturnType<typeof enterHookWorkflow>): boolean {
+  if (conversationHasNotJoined(workflow)) return true;
+  return selectedRecordIsFinished(workflow.projectDir, workflow.selection);
 }
 
 // Whether a gate may stand aside for this conversation: only when the selection
-// resolved and the conversation is known not to have joined it. A selection that
-// failed to resolve, or a participation that cannot be decided (malformed or
-// stale delegated worktree metadata), does not lower a gate: the gate takes its
-// ordinary path, which fails closed on the same error.
+// resolved and the conversation is known not to have joined it. Finished work
+// is not that case: the conversation did join it, so a gate keeps the path it
+// takes for a participant. A selection that failed to resolve, or a
+// participation that cannot be decided (malformed or stale delegated worktree
+// metadata), does not lower a gate: the gate takes its ordinary path, which
+// fails closed on the same error.
 export function hookOutsideGate(workflow: ReturnType<typeof enterHookWorkflow>): boolean {
   if (workflow.selection === null || workflow.participation === "indeterminate") return false;
-  return hookStandsOutside(workflow);
+  return conversationHasNotJoined(workflow);
 }
 
 export function stateFilePathForSelection(
@@ -10681,6 +10866,9 @@ const summaryRoute = (logVerb: "decision" | "answer"): GuardRemedyAnswerRoute =>
     lastEngineFlag(rest, "--checkpoint") === "summary-confirmation";
 const GUARD_REMEDY_ANSWER_ROUTES: Record<GuardRemedyOp, GuardRemedyAnswerPhases | null> = {
   "present-approval-gate": { afterPick: reportResult("awaiting-approval") },
+  // The conductor's own work only: an own-work ask writes no marker, so there
+  // is no pick to route.
+  "present-findings-at-gate": null,
   "request-review": { afterPick: reviewRoute },
   "start-recovery-review": { afterPick: reviewRoute },
   "apply-repairs-then-request": { afterPick: reviewRoute },
@@ -10703,6 +10891,10 @@ const GUARD_REMEDY_ANSWER_ROUTES: Record<GuardRemedyOp, GuardRemedyAnswerPhases 
   "restore-scope": null,
   "abort-bolt": null,
   "record-unit-completion": null,
+  // The conductor's own work only, as present-findings-at-gate.
+  "finish-unit-step": null,
+  "dispatch-pipeline-links": null,
+  "produce-stage-output": null,
   "repair-source-boundary": { afterPick: reviewRoute },
   // Present the summary (its prompt checkpoint) on the pick; record the
   // confirmation once the person gave it.
@@ -11759,10 +11951,13 @@ export function consumeCopilotConversation(
 ): boolean {
   return transactActiveDirective(projectDir, (marker, target) => {
     const context = activeDirectiveContext(target, stateContent);
+    // The stage's work recorded through `aidlc log` (markStageWorkLogged)
+    // leaves the engine mark, not an engine sequence: it is engagement here too.
     if (
       marker?.version !== 2 || marker.owner_session !== sessionId || marker.state_sha256 !== context.stateSha256 ||
       (marker.human_sequence ?? 0) <= (marker.engine_sequence ?? 0) ||
-      (marker.human_sequence ?? 0) <= (marker.conversation_sequence ?? 0)
+      (marker.human_sequence ?? 0) <= (marker.conversation_sequence ?? 0) ||
+      engineMarkedSincePersonSpoke(projectDir)
     ) return { marker, result: false, preserve: true };
     return {
       marker: {
@@ -12914,98 +13109,6 @@ export function approvedConstructionUnits(
   return approved;
 }
 
-// True when any stage sits at [?] (awaiting-approval) in the state file: the
-// "a gate is actually OPEN" predicate for the per-harness preToolUse floors.
-// Without it a floor would keep refusing tool calls AFTER a legitimate approval
-// (the resolution then follows the turn's only HUMAN_TURN), blocking the
-// same-turn continuation the stage protocol mandates.
-export function hasOpenGate(stateContent: string | null): boolean {
-  if (!stateContent) return false;
-  return parseCheckboxes(stateContent).some((c) => c.state === "awaiting-approval");
-}
-
-const CONSTRUCTION_POLICY_SETTER_FIELDS: Readonly<Record<string, string>> = {
-  "set-construction-iteration": "Construction Iteration",
-  "set-construction-checkpoints": "Construction Checkpoints",
-  "set-construction-execution": "Construction Execution",
-};
-
-// One Construction policy setter in exactly a form the engine issues, and the
-// field and value it sets, or null: `aidlc engine state <setter> <value>`,
-// `bun <harness>/tools/aidlc.ts engine state <setter> <value>`, or
-// `bun <harness>/tools/aidlc-state.ts <setter> <value>`, with the executable
-// named bare. No prelude, environment assignment, wrapper, interpreter option,
-// other path, chain, pipe, redirection or expansion matches.
-function literalConstructionPolicySetter(command: string): { field: string; value: string } | null {
-  const literal = parseLiteralShellInvocation(command);
-  if (!literal || literal.directory !== null) return null;
-  const words = literal.argv;
-  if (words.length !== literal.rawWords.length || words.some((word, i) => word !== literal.rawWords[i])) {
-    return null;
-  }
-  const tools = `${harnessDir()}/tools`;
-  let rest: string[];
-  if (words[0] === "aidlc" && words[1] === "engine" && words[2] === "state") rest = words.slice(3);
-  else if (words[0] === "bun" && words[1] === `${tools}/aidlc.ts` && words[2] === "engine" && words[3] === "state") {
-    rest = words.slice(4);
-  } else if (words[0] === "bun" && words[1] === `${tools}/aidlc-state.ts`) rest = words.slice(2);
-  else return null;
-  const field = CONSTRUCTION_POLICY_SETTER_FIELDS[rest[0] ?? ""];
-  return field !== undefined && rest.length === 2 ? { field, value: rest[1] } : null;
-}
-
-// The Review brief the protocol prints at the gate, before its question:
-// `bun <harness>/tools/aidlc-review-brief.ts review|summary ...`, or the same
-// through `aidlc engine review-brief` or `bun <harness>/tools/aidlc.ts engine
-// review-brief`, named bare as one command. It only reads.
-function literalReviewBriefRead(command: string): boolean {
-  const literal = parseLiteralShellInvocation(command);
-  if (!literal || literal.directory !== null) return false;
-  const words = literal.argv;
-  const tools = `${harnessDir()}/tools`;
-  let rest: string[];
-  if (words[0] === "aidlc" && words[1] === "engine" && words[2] === "review-brief") rest = words.slice(3);
-  else if (words[0] === "bun" && words[1] === `${tools}/aidlc.ts` && words[2] === "engine" && words[3] === "review-brief") {
-    rest = words.slice(4);
-  } else if (words[0] === "bun" && words[1] === `${tools}/aidlc-review-brief.ts`) rest = words.slice(2);
-  else return false;
-  return rest[0] === "review" || rest[0] === "summary";
-}
-
-// The human-presence floors' one rule (Kiro CLI and Kiro IDE): whether a tool
-// call waits for the person's turn. It holds only while a stage gate the person
-// must answer is open and no turn of theirs is on record since it opened. A
-// gate the engine approves itself (isAutonomousConstructionGate, the rule its
-// approval uses) does not need them, and the one Construction policy setter
-// their recorded choice authorizes (the setter's own check) runs while a gate
-// stays open for its later approval, as does the Review brief, which only
-// reads. None lets through what the engine would refuse, and a setter whose
-// receipt cannot be read leaves the floor holding.
-export function presenceFloorHolds(
-  projectDir: string,
-  stateContent: string | null,
-  command: string,
-): boolean {
-  if (!stateContent || !hasOpenGate(stateContent)) return false;
-  if (humanActedSinceGate(projectDir)) return false;
-  if (literalReviewBriefRead(command)) return false;
-  const setter = literalConstructionPolicySetter(command);
-  try {
-    if (setter !== null && constructionPolicyChangeAllowed(projectDir, setter.field, setter.value)) {
-      return false;
-    }
-  } catch { /* an unreadable receipt authorizes nothing */ }
-  return parseCheckboxes(stateContent).some((entry) => {
-    if (entry.state !== "awaiting-approval") return false;
-    try {
-      const stage = findStageBySlug(entry.slug);
-      return stage === undefined || !isAutonomousConstructionGate(stateContent, stage, projectDir);
-    } catch {
-      return true; // a gate that cannot be classified is the person's
-    }
-  });
-}
-
 // The interview path (handleAnswer) uses the SAME resolution-boundary check: a
 // QUESTION_ANSWERED is itself a gate resolution, so "a human turn since the last
 // resolution" bounds what a reply can answer (the caller lets one reply answer
@@ -13072,6 +13175,16 @@ export function readVerificationCommandFile(projectDir: string, file: string): V
  *  without passing through any shell (bash, PowerShell, or cmd.exe). */
 export const ANSWER_TEXT_DIR = ".aidlc-engine/answer-text";
 const ANSWER_TEXT_MAX_BYTES = 64 * 1024;
+
+/** The folder in a piece of work's record where the agent writes a stage's
+ *  learnings picks for `learnings persist --selections-json` (#1592): one file
+ *  per stage, the path `learnings surface` returns, the only one persist reads. */
+export const LEARNINGS_SELECTIONS_DIR = `${ENGINE_DIR}/learnings`;
+
+/** The record folders the agent may write while Plan Approval waits: text only
+ *  the engine reads (answer text, learnings picks), never a planning authority
+ *  file. The plan-approval guard and every adapter that mirrors it read this. */
+export const ENGINE_TEXT_DIRS: readonly string[] = [ANSWER_TEXT_DIR, LEARNINGS_SELECTIONS_DIR];
 
 /** The project folder where a person's request for `next --request-file` is
  *  written, so the words reach the engine without passing through any shell.
@@ -19649,6 +19762,8 @@ export interface ReviewAttemptAccounting {
       // The request row names its own review file (rows recorded before
       // per-request review files do not).
       ownReviewFile: boolean;
+      // Admitted past the pass budget because the person asked (Person Asked).
+      personAsked: boolean;
     }
   >;
   recoveryIteration: number | null;
@@ -19956,6 +20071,7 @@ export function reviewAttemptAccounting(
       binding: ReviewRequestBinding | null;
       retried: boolean;
       ownReviewFile: boolean;
+      personAsked: boolean;
     }
   >();
   for (let i = floor + 1; i < events.length; i++) {
@@ -20015,6 +20131,7 @@ export function reviewAttemptAccounting(
             (auditBlockField(entry.block, "Retry") === "pending-request" &&
               modernBinding)),
         ownReviewFile: auditBlockField(entry.block, "Review File") !== null,
+        personAsked: auditBlockField(entry.block, "Person Asked") === "true",
       });
     } else {
       const pending = pendingRequests.get(iteration);
@@ -27933,8 +28050,9 @@ export function stopHookDir(projectDir: string, intent?: string, space?: string)
 //   .aidlc-engine/human-turn   - touched by the UserPromptSubmit mint, once per human
 //                         prompt, alongside the HUMAN_TURN ledger event.
 //   .aidlc-engine/engine-touch - touched by aidlc-orchestrate on every ADVANCING
-//                         invocation (`next` / `report` / `park`), and by
-//                         `intent create` for the work it creates.
+//                         invocation (`next` / `report` / `park`), by
+//                         `intent create` for the work it creates, and by a
+//                         `log answer|review|link` the logger counts as stage work.
 //
 //   conversational  <=>  mtime(.aidlc-engine/human-turn) > mtime(.aidlc-engine/engine-touch)
 //
@@ -28122,19 +28240,21 @@ export function turnEndIsOpen(projectDir: string, intent?: string, space?: strin
 
 // Record that the workflow engine was ADVANCED (not merely probed). Called from
 // orchestrate's `next` / `report` / `park`, from `intent create` for the work it
-// creates, and from the intent and space switches for the work they select (a
+// creates, from the intent and space switches for the work they select (a
 // record with no mark, made before the markers shipped or freshly cloned, would
 // otherwise read every later plain question as the engine's unfinished turn on
-// the transcript-free hosts). A no-op in three cases: when STOP_HOOK_PROBE_ENV
-// is set (the Stop hook's own probe, see above), for read-only utility routing
-// (excluded at the call site), and before creation.
+// the transcript-free hosts), and through markStageWorkLogged (below) from a
+// `log answer` / `log review` / `log link` the logger counts as stage work. A no-op in
+// three cases: when STOP_HOOK_PROBE_ENV is set (the Stop hook's own probe, see
+// above), for read-only utility routing (excluded at the call site), and
+// before creation.
 //
 // KNOWN COVERAGE GAP — the marker sees LESS than the transcript predicate does.
 // isEngineToolCall (below) counts as engagement any non-read-only aidlc-jump /
 // aidlc-bolt / aidlc-swarm invocation and the mutating aidlc-state verbs
 // (approve, advance, skip, set, …). NONE of those tools touch this marker: the
-// only writers are orchestrate's three subcommands, intent create and the two
-// switches. So on a transcript-free
+// only writers are orchestrate's three subcommands, intent create, the two
+// switches and the stage-work log verbs. So on a transcript-free
 // harness a conductor that runs, say, `aidlc-jump` — mutating the stage pointer
 // and emitting audit — and then ends its turn without consulting the engine
 // reads as CONVERSATIONAL here, while the same turn BLOCKS on Claude/Codex where
@@ -28153,6 +28273,85 @@ export function markEngineTouch(projectDir: string, intent?: string, space?: str
   if (!workflowIsCreated(projectDir, intent, space)) return;
   touchTurnMarker(projectDir, "engine-touch", intent, space);
 }
+
+// --- Stage work recorded through `aidlc log` (the conversational carve-out) ---
+//
+// A turn that answers the stage's questions, requests its review and records
+// the verdict does all of it through `log answer` / `log review` (and a
+// pipeline stage's `log link`), with no `next` or `report`. Such a turn is the
+// stage's work in flight, not chat: one that ends before the gate is a bail
+// mid-stage, and the carve-out must not release it (#2400). aidlc-log is the
+// one owner of that call: after a row it recorded it leaves the engine mark
+// (markStageWorkLogged), or the turn-end mark when the person answers next
+// (an answer whose reply also asked something, `--ends-turn`; a summary's
+// Request changes with nothing said, which asks "What should change?"; and
+// the learnings question's Add a note), or no mark for a review of a stage
+// no longer in flight. Both evidence paths read that mark, kept here rather
+// than in isEngineEngagementSegment, which also feeds the forwarding-loop and
+// runtime-compile detectors:
+//
+//   - marker path (Kiro IDE, Kiro CLI, opencode): the engine mark itself;
+//   - transcript path (Claude Code, Codex): a call isStageWorkLogCall names,
+//     whose own correlated result shows the `emitted` row it recorded, with
+//     the engine mark newer than the person's turn (stageWorkLogged).
+//
+// A refusal recorded nothing, and several tell the agent to end its turn, so
+// the stop stays allowed. Not counted either: `log decision` (a logged
+// question waits on the person, which the pending-decision carve-out lets end
+// the turn), `log answers` (a read), and the Plan Approval and guard-recovery
+// answers, which record through their own owners (recordPlanApprovalAnswer,
+// recordGuardRecoveryChoice) and print `recorded`, not `emitted`: several of
+// them end the turn (I'll edit the files, Request Changes, a park).
+const STAGE_WORK_LOG_VERBS: ReadonlySet<string> = new Set(["answer", "review", "link"]);
+
+// Marker path: the engine mark for a `log` subcommand that recorded the stage's work.
+export function markStageWorkLogged(verb: string | undefined, projectDir: string, intent?: string, space?: string): void {
+  if (verb === undefined || !STAGE_WORK_LOG_VERBS.has(verb)) return;
+  markEngineTouch(projectDir, intent, space);
+}
+
+// Transcript path, the call: a shell command that runs one of the verbs, in
+// the native (`aidlc engine log review`), source-dispatcher (`bun
+// <harness>/tools/aidlc.ts engine log review`) or legacy (`aidlc-log.ts
+// review`) spelling.
+export function isStageWorkLogCall(name: string, input: unknown): boolean {
+  if (!isShellToolName(name)) return false;
+  const text = shellCommandText(input);
+  if (text === null) return false;
+  const verbs = canonicalEngineCommand(text)
+    .matchAll(/(?:\baidlc[ \t]+(?:engine[ \t]+)?log|\baidlc-log(?:\.ts)?["']?)[ \t]+([a-z-]+)/g);
+  for (const match of verbs) if (STAGE_WORK_LOG_VERBS.has(match[1] as string)) return true;
+  return false;
+}
+
+// Transcript path, the result: the call's output carries the `emitted` row it
+// recorded (a refusal, a skip and a print-only answer carry none), and the
+// logger left the engine mark after the person's last turn, which it does only
+// for the stage's work. The output is the text a transcript keeps (a string, a
+// Codex JSON string, or Claude text parts). Any unreadable mark is no evidence.
+export function stageWorkLogged(output: unknown, projectDir: string): boolean {
+  const text = typeof output === "string"
+    ? output
+    : Array.isArray(output)
+      ? output.map((part) => isPlainObject(part) && typeof part.text === "string" ? part.text : "").join("\n")
+      : "";
+  if (!/\\?"emitted\\?"\s*:\s*\\?"[A-Z][A-Z_]*\\?"/.test(text)) return false;
+  return engineMarkedSincePersonSpoke(projectDir);
+}
+
+// The engine mark is newer than the person's turn: the copilot path reads it
+// beside its own sequences, which a `log` call does not advance. Any
+// unreadable mark is no evidence.
+export function engineMarkedSincePersonSpoke(projectDir: string): boolean {
+  try {
+    const human = turnMarkerStat(projectDir, "human-turn");
+    const engine = turnMarkerStat(projectDir, "engine-touch");
+    return human?.isFile() === true && engine?.isFile() === true && engine.mtimeMs > human.mtimeMs;
+  } catch {
+    return false;
+  }
+}
+
 
 // The engine mark for the work an intent or space switch selects. Written only
 // when the record has none (work made before the markers shipped, or a fresh
@@ -31172,10 +31371,10 @@ export function removeField(content: string, field: string): string {
 // --- Refs-list field operations (Bolt Refs in v7 state template) ---
 //
 // `Bolt Refs` is a list-shaped single-line value with a literal `[empty list]`
-// placeholder when empty (state-template.md:11) — `aidlc-utility.ts`'s init
-// emitter at line 1391 also produces a bare-empty shape (no value after the
-// colon). Both are tolerated on parse; emit always produces `[empty list]`
-// when empty for round-trip determinism.
+// placeholder when empty; `aidlc-utility.ts` handleIntentCreateStateBuild
+// writes a bare-empty shape (no value after the colon). Both are tolerated on
+// parse; emit always produces `[empty list]` when empty for round-trip
+// determinism.
 export function parseRefsList(value: string): string[] {
   const trimmed = value.trim();
   if (trimmed === "" || trimmed === "[empty list]") return [];
@@ -31289,6 +31488,9 @@ export type GuardLifecycleState =
 // values; the `action` sentence beside each is presentation.
 export const GUARD_REMEDY_OPS = [
   "present-approval-gate",
+  // The same gate as the conductor's own step: the review cap refused a pass
+  // nobody asked for, so the findings go to the gate and the person decides there.
+  "present-findings-at-gate",
   "request-review",
   "start-recovery-review",
   "apply-repairs-then-request",
@@ -31314,6 +31516,13 @@ export const GUARD_REMEDY_OPS = [
   // Record a Unit's missing UNIT_COMPLETED receipt from the artifacts already
   // on disk, when the gate needs it and the Unit's work is done.
   "record-unit-completion",
+  // record-unit-completion's finish as the conductor's own step: the review cap
+  // refused a pass nobody asked for part way through a Unit's step.
+  "finish-unit-step",
+  // Dispatch the pipeline links the stage has not recorded, and record each.
+  "dispatch-pipeline-links",
+  // Write the outputs or the code a stage was reported without.
+  "produce-stage-output",
   "repair-source-boundary",
   "reconfirm-summary",
   "unset-unattended",
@@ -31383,7 +31592,8 @@ export interface GuardAttemptState {
   requestReview?: string;
   summaryCoverage: "current" | "stale" | "missing";
   reviewCoverage: "current" | "stale" | "missing";
-  sourceCoverage: "current" | "stale" | "missing" | "unbindable";
+  // "unreadable": this machine could not read the source to compare it.
+  sourceCoverage: "current" | "stale" | "missing" | "unbindable" | "unreadable";
 }
 
 export interface GuardHumanAuthorityState {
@@ -31744,6 +31954,16 @@ export function requestChangesReportCommand(projectDir: string, stage: string, u
   );
 }
 
+// The report that shows a stage's approval gate, rendered for this checkout:
+// `awaiting-approval` the first time (and again while it is open), `revised`
+// after a revision.
+export function stageGateReportCommand(stage: string, result: "awaiting-approval" | "revised"): string {
+  return renderEngineInvocation(
+    { route: "orchestrate", args: ["report", "--stage", stage, "--result", result] },
+    { harnessDir: harnessDir() },
+  );
+}
+
 // The scopes whose plan runs this stage, for a remedy that switches to one.
 function scopesRunningStage(slug: string): string[] {
   try {
@@ -31964,7 +32184,7 @@ const GUARD_REMEDY_WORDING_BY_OP: Record<GuardRemedyOp, GuardRemedyWording> = GU
 // Kiro IDE: it ran the reviewer with no request, so no review was recorded),
 // and "have the reviewer review it" was read as writing the review in the
 // reviewer's name. The words match the review request's own step.
-function reviewRequestAction(lead: string, request: string | undefined): string {
+export function reviewRequestAction(lead: string, request: string | undefined): string {
   if (request === undefined) return `${lead}.`;
   return `${lead}: run \`${request}\`, then dispatch the reviewer named in it as a subagent and have it write ` +
     "the `reviewFile` that command returns: that file is the reviewer's, so never write it yourself and never " +
@@ -32023,6 +32243,31 @@ export function evaluateGuardRefusal(
         // `unit complete` records it only once the person picked it.
         requiresHuman: true,
         executableNow: true,
+      });
+    }
+    // A pipeline handoff is missing: the way on is the conductor's own, to
+    // dispatch the links and record each, which the refusal's sentence says
+    // (pipelineLinkWayOn, with the links named). No review records a link.
+    const pipelineLinks = input.code === "PIPELINE_EVIDENCE_MISSING";
+    if (pipelineLinks) {
+      remedies.push({
+        op: "dispatch-pipeline-links",
+        action: input.userMessage,
+        requiresHuman: false,
+        executableNow: openForWork || state === "revising",
+      });
+    }
+    // The stage was reported before its outputs or its code exist: writing
+    // them is the conductor's own step, which the refusal's sentence names.
+    // No review or reset produces them.
+    const missingOutput = input.code === "REQUIRED_ARTIFACTS_MISSING" ||
+      input.code === "REQUIRED_SOURCE_WORK_MISSING";
+    if (missingOutput) {
+      remedies.push({
+        op: "produce-stage-output",
+        action: input.userMessage,
+        requiresHuman: false,
+        executableNow: openForWork || state === "revising",
       });
     }
     if (input.attempt.pendingReview) {
@@ -32113,7 +32358,14 @@ export function evaluateGuardRefusal(
       ? unitStepInProgress(input)
       : null;
     if (midStep !== null) {
-      remedies.push(finishUnitStepRemedy(input.stage, midStep), reopenUnitStepRemedy(input.stage, midStep));
+      const finish = finishUnitStepRemedy(input.stage, midStep);
+      // The cap refused a pass nobody asked for, as at a gate below: finishing
+      // the step with the review it has is the conductor's own step. A repeat
+      // still offers the person both.
+      if (input.code === "REVIEW_BUDGET_EXHAUSTED") {
+        remedies.push({ op: "finish-unit-step", action: finish.action, requiresHuman: false, executableNow: true });
+      }
+      remedies.push(finish, reopenUnitStepRemedy(input.stage, midStep));
     } else if (
       !reviewBudgetAvailable &&
       input.attempt.reviewCoverage === "current" &&
@@ -32130,14 +32382,26 @@ export function evaluateGuardRefusal(
         route: "orchestrate",
         args: ["next", ...(input.projectDir ? ["--project-dir", input.projectDir] : [])],
       }, { harnessDir: harnessDir() });
+      const presentGate = checkpointUnit === null
+        ? "Present the unresolved review findings at the approval gate for the " +
+          "human instead of starting another review pass."
+        : `Present the unresolved review findings at unit "${checkpointUnit}"'s checkpoint ` +
+          `for the human instead of starting another review pass: run \`${showCheckpoint}\`, ` +
+          "which shows that checkpoint again, and ask it with the findings.";
+      // The cap refused a pass nobody asked for (the log tool sends this code
+      // here only when the person has not spoken since the last request): the
+      // gate is the conductor's own step. A repeat still offers it to the person.
+      if (input.code === "REVIEW_BUDGET_EXHAUSTED") {
+        remedies.push({
+          op: "present-findings-at-gate",
+          action: presentGate,
+          requiresHuman: false,
+          executableNow: true,
+        });
+      }
       remedies.push({
         op: "present-approval-gate",
-        action: checkpointUnit === null
-          ? "Present the unresolved review findings at the approval gate for the " +
-            "human instead of starting another review pass."
-          : `Present the unresolved review findings at unit "${checkpointUnit}"'s checkpoint ` +
-            `for the human instead of starting another review pass: run \`${showCheckpoint}\`, ` +
-            "which shows that checkpoint again, and ask it with the findings.",
+        action: presentGate,
         requiresHuman: true,
         executableNow: true,
       });
@@ -32146,23 +32410,29 @@ export function evaluateGuardRefusal(
       !input.attempt.pendingReview &&
       !input.attempt.repairReview &&
       !input.attempt.nextReview;
+    // The source changed after a review that still stands for the output: the
+    // one recovery review clears it, as it clears a changed output.
+    const sourceRecovery = input.code === "SOURCE_REVIEW_STALE" && input.attempt.sourceCoverage === "stale";
     if (
       input.attempt.recovery === "available" &&
-      input.attempt.reviewCoverage === "stale" &&
+      (input.attempt.reviewCoverage === "stale" || sourceRecovery) &&
       noReviewInFlight
     ) {
       remedies.push({
         op: "start-recovery-review",
-        action:
-          "Start the one stale-review recovery review against the current " +
-          "artifact and source state.",
+        action: reviewRequestAction(
+          "Start the one stale-review recovery review against the current artifact and source state",
+          input.attempt.requestReview,
+        ),
         requiresHuman: false,
         executableNow: input.attempt.summaryCoverage === "current" && openForWork,
       });
     } else if (
       reviewBudgetAvailable &&
       input.attempt.reviewCoverage === "missing" &&
-      noReviewInFlight
+      noReviewInFlight &&
+      !pipelineLinks &&
+      !missingOutput
     ) {
       remedies.push({
         op: "request-review",
@@ -32458,11 +32728,13 @@ export function guardAttemptState(
     sourceCoverage:
       receipts?.sourceStaleReason === "boundary-unbindable"
         ? "unbindable"
-        : receipts?.sourceStale
-          ? "stale"
-          : receipts?.newestSourceFingerprint
-            ? "current"
-            : "missing",
+        : receipts?.sourceStaleReason === "source-unreadable"
+          ? "unreadable"
+          : receipts?.sourceStale
+            ? "stale"
+            : receipts?.newestSourceFingerprint
+              ? "current"
+              : "missing",
   };
   return {
     attempt,
@@ -32474,6 +32746,192 @@ export function guardAttemptState(
         unit === undefined ? "none" : receipts?.unitIterations.get(unit) ?? "none"
       }`,
     ],
+  };
+}
+
+// The record's half of "the person asked for this review": they spoke since the
+// last decision, after the last request for this review. Whether their words
+// asked for it is the conductor's reading (--person-asked); the two together
+// lift the pass cap and the one recovery, which bound only the reviews the
+// agent starts on its own.
+export function personSpokeSinceReviewRequest(
+  pd: string,
+  stage: string,
+  reviewer: string,
+  unit: string | undefined,
+  intent?: string | null,
+  space?: string,
+): boolean {
+  if (!personSpokeSinceGate(pd, { requests: true })) return false;
+  let turn: AuditShardEvent | null = null;
+  let request: AuditShardEvent | null = null;
+  for (const row of sortAttemptEvents(readAuditShardEvents(pd, intent ?? undefined, space))) {
+    if (isRequestTurn(row)) turn = row;
+    else if (
+      row.event === "REVIEW_REQUESTED" && auditBlockField(row.block, "Stage") === stage &&
+      auditBlockField(row.block, "Reviewer") === reviewer && (auditBlockField(row.block, "Unit") || undefined) === unit
+    ) request = row;
+  }
+  return turn !== null && (request === null || attemptEventDefinitelyBefore(request, turn));
+}
+
+// The step that gets an open review finished, said from the attempt state
+// alone, so `next` and every caller word it once. `subject` opens the sentence
+// ("Unit "x"'s Build work is written"). Kinds: `request` (a request is owed: the
+// documents changed since it was asked, or the repairs are made, or the review
+// did not finish), `verdict` (a request is waiting for its verdict, or for one
+// more try), `repairs` (the reviewer asked for repairs: they are the lead's own
+// work, so a caller that hands the lead its stage body leaves this one to it).
+// Null when no command settles it: nothing was asked, the review is final, or
+// the request can be neither retried nor recorded (a required document is
+// gone, which restoring is the lead's work).
+//
+// It reads no review file: the logger refuses a verdict with none and says what
+// to do, so a second check here would be a second copy of that rule. What it
+// does read is whether the one retry is spent, which decides the wording.
+//
+// `personFirst` marks a step that puts the person's words ahead of its own
+// commands: it ends the turn after the agent has done what they asked, so a
+// caller that sends the agent back to `next` afterwards leaves it out, or the
+// same step comes back for as long as nothing changes.
+export type NextReviewStep = { kind: "request" | "verdict" | "repairs"; text: string; personFirst?: true };
+
+export function nextReviewStepFor(input: {
+  attempt: GuardAttemptState;
+  didNotFinish?: boolean;
+  // The recorded review could not be verified: the request is run again, and
+  // only then is a verdict recorded, as the completion guards say. Approval
+  // over it is refused whatever the person wrote, so when they have written the
+  // step puts their words first and leaves the rerun theirs to ask for.
+  verificationFailed?: boolean;
+  // The exact retry of the waiting request, given while its one retry is unspent.
+  retryRequest?: string;
+  // The person wrote since the review was asked (the recorded fact, not their
+  // words): what they asked comes first, and the retry and the NOT-READY
+  // fallback, which are for a review that stopped with no person involved, are
+  // not named.
+  personSpoke?: boolean;
+  // Whether their approval may go over this review (personMayApproveOverUnfinishedReview),
+  // and when it may not, the memory file that holds Guard Policy strict.
+  approval?: { allowed: true } | { allowed: false; lockedIn: string | null };
+  // The command that asks `next` again; a person-first step runs it only when
+  // the person asked to carry on with the review.
+  nextCommand?: string;
+  // The review file the open request names (project-relative), so a chat that
+  // never saw the request knows where the verdict is written.
+  reviewFile?: string;
+  // Whether a spent retry names the NOT-READY fallback. Off after the person
+  // has written, on a route that does not put their words first.
+  fallback?: boolean;
+  subject: string;
+}): NextReviewStep | null {
+  const { attempt, subject } = input;
+  const person = input.personSpoke === true;
+  const approval = input.approval ?? { allowed: true };
+  const first = "the person has written since it was asked, so what they asked comes first " +
+    (approval.allowed
+      ? "(if they asked to approve the work as it is, report that approval with their words)"
+      : approval.lockedIn !== undefined && approval.lockedIn !== null
+        ? `(approval cannot go over this review: your team set Guard Policy to strict in ${approval.lockedIn}, ` +
+          "so the review needs its verdict first; changing that line there changes it)"
+        : "(approval cannot go over this review while Guard Policy is strict; the review needs its verdict first)");
+  // What the person's own words leave undone: a question or an approval ends
+  // the turn with no review command run; only carrying on goes on.
+  const carryOn = input.nextCommand === undefined ? "" : ` Then run \`${input.nextCommand}\`.`;
+  const otherwiseStop = " If they asked for anything else, do that and stop.";
+  if (attempt.nextReview?.request !== undefined) {
+    const lead = `${subject}, but its review has to be asked for again${person ? `, and ${first}. If they asked to carry on with the review,` : ","} ` +
+      `request pass ${attempt.nextReview.iteration}`;
+    return {
+      kind: "request",
+      text: reviewRequestAction(lead, attempt.nextReview.request) + (person ? carryOn + otherwiseStop : ""),
+      ...(person ? { personFirst: true as const } : {}),
+    };
+  }
+  if (attempt.repairReview !== undefined) {
+    if (attempt.requestReview === undefined) return null;
+    const next = attempt.repairReview.iteration + 1;
+    return input.didNotFinish === true
+      ? {
+        kind: "request",
+        text: reviewRequestAction(
+          `${subject}, but its review did not finish and nothing was reviewed${person ? `, and ${first}. If they asked to carry on with the review,` : ","} ` +
+            `request pass ${next}`,
+          attempt.requestReview,
+        ) + (person ? carryOn + otherwiseStop : ""),
+        ...(person ? { personFirst: true as const } : {}),
+      }
+      : {
+        kind: "repairs",
+        text: `${subject} and its review asked for repairs: make them, then request pass ` +
+          `${next} with \`${attempt.requestReview}\` and record the verdict.`,
+      };
+  }
+  const pending = attempt.pendingReview;
+  if (pending === undefined) return null;
+  if (input.verificationFailed === true) {
+    const rerun = pending.retryable && input.retryRequest !== undefined;
+    if (person) {
+      return {
+        kind: "verdict",
+        personFirst: true,
+        text: `${subject} and its recorded review could not be verified, and the person has written since it was asked, ` +
+          "so what they asked comes first (approval cannot go over a review that could not be verified; it has to run again first)." +
+          (rerun
+            ? ` ${reviewRequestAction("If they asked to carry on with the review, run it again", input.retryRequest)}${carryOn}`
+            : "") + otherwiseStop,
+      };
+    }
+    if (!rerun) return null;
+    return {
+      kind: "verdict",
+      text: reviewRequestAction(`${subject} and its recorded review could not be verified: run the review again`, input.retryRequest),
+    };
+  }
+  const record = pending.verdictRecordable === true && pending.recordVerdict !== undefined
+    ? `record the verdict for pass ${pending.iteration} with \`${pending.recordVerdict}\` ` +
+      (input.reviewFile === undefined
+        ? "(the verdict is the one the reviewer's review file states)"
+        : `(the verdict is the one the reviewer's review file states: ${input.reviewFile})`)
+    : null;
+  if (person) {
+    return {
+      kind: "verdict",
+      personFirst: true,
+      text: `${subject} and its review has no verdict yet, and ${first}.` +
+        (record === null ? "" : ` If they asked to carry on with the review and the reviewer's review is there, ${record}.`) +
+        (pending.retryable && input.retryRequest !== undefined
+          ? ` ${reviewRequestAction(
+            record === null
+              ? "If they asked to carry on, ask the reviewer again"
+              : "If they asked to carry on and no review is there, ask the reviewer again",
+            input.retryRequest,
+          )}`
+          : "") +
+        (record !== null && !(pending.retryable && input.retryRequest !== undefined) && input.fallback !== false
+          ? " If they asked to carry on and no review file is there, record NOT-READY without one; that records a " +
+            "review that did not finish, not a finding."
+          : "") +
+        (record === null && !(pending.retryable && input.retryRequest !== undefined) ? "" : carryOn) + otherwiseStop,
+    };
+  }
+  if (pending.retryable && input.retryRequest !== undefined) {
+    return {
+      kind: "verdict",
+      text: record === null
+        ? reviewRequestAction(`${subject} and its review is waiting: ask the reviewer again`, input.retryRequest)
+        : `${subject} and its review is waiting for a verdict: ${record}; if the reviewer wrote no review, ` +
+          reviewRequestAction("ask it again once", input.retryRequest),
+    };
+  }
+  if (record === null) return null;
+  return {
+    kind: "verdict",
+    text: `${subject} and its review is waiting for a verdict, and its one retry is spent: ${record}.` +
+      (input.fallback === false
+        ? ""
+        : " If the retried reviewer still wrote no review file, record NOT-READY without one; that records a " +
+          "review that did not finish, not a finding."),
   };
 }
 
@@ -35965,21 +36423,29 @@ export function pipelineLinkEvidence(
 
 // The way on for missing pipeline handoffs, one sentence for the engine's
 // refusal and the state tool's floor: the conductor's own step. The evidence
-// switch is the person's, so neither names it.
+// switch is the person's, so neither names it. At an open gate `next` shows
+// the gate only once the links are in, so it comes last there; with the
+// person's approval in hand, `approval` (the step that applies it) comes last
+// instead, so they are never asked again.
 export function pipelineLinkWayOn(
   projectDir: string,
   slug: string,
-  options: { repos: boolean; singleRun?: boolean },
+  options: { repos: boolean; singleRun?: boolean; gateOpen?: boolean; approval?: string },
 ): string {
   const singleRun = options.singleRun === true;
-  return `Re-run \`${aidlcToolInvocation("orchestrate")} next${singleRun ? ` --single --stage ${slug}` : ""}\` ` +
-    `and dispatch the missing pipeline links in their declared order, carrying the human's revision feedback. ` +
+  const next = `\`${aidlcToolInvocation("orchestrate")} next${singleRun ? ` --single --stage ${slug}` : ""}\``;
+  const link = `\`${aidlcToolInvocation("log")} link --stage ${slug} ` +
+    `--link <agent>${options.repos ? " --repo <repo>" : ""}${singleRun ? " --single" : ""}\``;
+  const last = options.approval !== undefined
+    ? `; then run ${options.approval}: the person's approval stands, so they are not asked again`
+    : options.gateOpen ? `; then re-run ${next}, which shows the gate again` : "";
+  return (last ? "Dispatch" : `Re-run ${next} and dispatch`) +
+    " the missing pipeline links in their declared order, carrying the human's revision feedback. " +
     (guardPolicyAcceptsChanges(projectDir)
       ? ""
       : "Rejection starts a new attempt: earlier scans and receipts cannot certify this revision, even for a targeted artifact edit. ") +
-    `After each link returns, run \`${aidlcToolInvocation("log")} link --stage ${slug} ` +
-    `--link <agent>${options.repos ? " --repo <repo>" : ""}` +
-    `${singleRun ? " --single" : ""}\`. Do not re-stamp an old handoff or disable evidence checks to reopen the gate.`;
+    `After each link returns, run ${link}${last}. ` +
+    "Do not re-stamp an old handoff or disable evidence checks to reopen the gate.";
 }
 
 export type UnitGateScope = "per-stage" | "unit-end";
@@ -38214,6 +38680,24 @@ export function isKiroConductorAgentFile(name: string): boolean {
   return KIRO_CONDUCTOR_AGENT_FILES.includes(basename(name));
 }
 
+// A reviewer copy one review request writes on Kiro (kiro-ide) when the
+// reviewer read-scope preview feature is on (aidlc-kiro-review-copy.ts): the
+// installed reviewer with that review's read scope added, named from the
+// request id so the name stands for that one request. It is the reviewer under
+// another name, never a persona of its own.
+const SCOPED_REVIEW_COPY_RE = /^aidlc-scoped-review-[0-9a-f]{12}$/;
+
+/** The reviewer copy's agent name for a review request id, or null for an id not minted as `review:<hex>`. */
+export function scopedReviewCopyName(requestId: string): string | null {
+  const m = /^review:([0-9a-f]{12})[0-9a-f]{20}$/.exec(requestId);
+  return m ? `aidlc-scoped-review-${m[1]}` : null;
+}
+
+/** Whether an agent name, or an agent file name, is a reviewer copy's. */
+export function isScopedReviewCopy(name: string): boolean {
+  return SCOPED_REVIEW_COPY_RE.test(basename(name).replace(/\.md$/, ""));
+}
+
 export function isAidlcAgentFile(path: string): boolean {
   return aidlcAgentClaim(path) !== null;
 }
@@ -38238,7 +38722,7 @@ export function readAgents(dir: string): AgentMetadata[] {
   const slugToFile = new Map<string, string>();
   const agents: AgentMetadata[] = [];
   const files = readdirSync(dir)
-    .filter((f) => f.endsWith(".md") && !isKiroConductorAgentFile(f))
+    .filter((f) => f.endsWith(".md") && !isKiroConductorAgentFile(f) && !isScopedReviewCopy(f))
     .sort();
   for (const f of files) {
     const filePath = join(dir, f);
@@ -38813,8 +39297,8 @@ export function parseMemoryEntries(raw: string): Array<{
 }
 
 // Split a single counted memory line into ts / unit / summary / context. The
-// canonical shape is `- <ISO> — <summary>; <context>` (stage-protocol.md
-// :876-879). Tolerates a missing `;` (tail → summary, context empty) and a
+// canonical shape is `- <ISO> — <summary>; <context>`.
+// Tolerates a missing `;` (tail → summary, context empty) and a
 // missing ts/em-dash (degrade to summary = the whole line, ts empty).
 // A Unit's iteration of a stage adds `[unit <name>]` after the timestamp.
 function parseMemoryEntryLine(trimmed: string): {
@@ -38849,7 +39333,7 @@ function parseMemoryEntryLine(trimmed: string): {
 // emitStageFrontmatter is the inverse — turns a StageFrontmatter-shaped
 // object back into YAML bytes. Symmetric with parseStageFrontmatter:
 // parse → emit → parse yields the same object. Field order is pinned
-// to stage-definition.md:84-110's worked example so diffs stay stable.
+// to the worked example in stage-definition.md so diffs stay stable.
 export function emitStageFrontmatter(obj: Record<string, unknown>): string {
   const needsQuote = (v: string): boolean => /[:#]|^\s|\s$/.test(v);
   const emitScalar = (v: string): string =>
@@ -38938,6 +39422,9 @@ export function emitStageFrontmatter(obj: Record<string, unknown>): string {
           }
           if (typeof e.conditional_on === "string") {
             lines.push(`    conditional_on: ${emitScalar(e.conditional_on)}`);
+          }
+          if (typeof e.cited === "boolean") {
+            lines.push(`    cited: ${e.cited}`);
           }
         }
       }
@@ -39239,7 +39726,7 @@ export function nextInScopeStage(
   // subgraphForScope-based iteration — proven by t66 walk parity across
   // all 11 scopes. The uncommon case (a hand-edited state file promoting
   // a scope-SKIP stage to EXECUTE) is the power-user escape hatch
-  // aidlc-state.ts:276-284's explicit-advance path also honours; keeping
+  // aidlc-state.ts's explicit-advance path (handleAdvance) also honours; keeping
   // both callers consistent on the same input.
   const graph = loadStageGraph();
   const currentIdx = graph.findIndex((s) => s.slug === afterSlug);
@@ -39731,17 +40218,6 @@ export function scopeCostSummary(scope: string): ScopeCostSummary | null {
   return summary;
 }
 
-/** Human-readable policy clause appended to the scope's stage/gate counts.
- * Collaborators off reads as what runs instead: the lead agent alone. */
-export function ceremonyOffClause(summary: ScopeCostSummary): string {
-  const off = summary.off.filter((label) => label !== "collaborators");
-  const leadOnly = off.length < summary.off.length ? "; lead agent only" : "";
-  if (off.length === 0) return leadOnly;
-  if (off.length === 1) return `; no ${off[0]}${leadOnly}`;
-  if (off.length === 2) return `; no ${off[0]} or ${off[1]}${leadOnly}`;
-  return `; no ${off.slice(0, -1).join(", ")}, or ${off[off.length - 1]}${leadOnly}`;
-}
-
 // --- Timestamp ---
 
 export function isoTimestamp(): string {
@@ -39823,6 +40299,86 @@ export function removeHookStatusFile(healthDir: string, fileName: string): boole
   } catch {
     return false;
   }
+}
+
+// --- A core hook run in the calling process ---
+//
+// An adapter that starts a core hook as a child loads the whole engine again
+// for it, so a tool call whose guards each run as a child pays one engine load
+// per guard. runHookHere imports the hook and calls its run(input) in this
+// process instead: the environment the child would have been given on top of
+// this one (`env`, the project pins) is set only while it runs, and both
+// streams are collected as the child's pipes collected them. It answers null
+// when the hook cannot be imported or exports no run(), and the caller starts
+// it as a child as before. collectHookOutput is the collecting half, for a
+// step that is not a hook file (an adapter running its own cases as a group).
+
+export interface HookOutput {
+  stdout: string;
+  stderr: string;
+  code: number;
+}
+
+export async function runHookHere(
+  hookPath: string,
+  input: string,
+  env: Readonly<Record<string, string>> = {},
+): Promise<HookOutput | null> {
+  let mod: { run?: unknown };
+  try {
+    mod = (await import(pathToFileURL(hookPath).href)) as { run?: unknown };
+  } catch {
+    return null;
+  }
+  if (typeof mod.run !== "function") return null;
+  const hookRun = mod.run as (input: string) => number | Promise<number>;
+  const previous = Object.entries(env).map(([key]) => [key, process.env[key]] as const);
+  Object.assign(process.env, env);
+  try {
+    return await collectHookOutput(() => hookRun(input));
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+// A step that throws fails alone: code 1, never a refusal, with the error
+// written as Bun writes an uncaught one when a process ends on it (`error:`
+// for a plain Error), so a reader of the text, doctor's drop line among them,
+// finds the line the crashed child left. Bun's console.* writes past
+// process.stdout.write and is not collected; the core hooks write through
+// process.stdout and process.stderr.
+export async function collectHookOutput(
+  step: () => number | Promise<number>,
+): Promise<HookOutput> {
+  const out: string[] = [];
+  const err: string[] = [];
+  const stdoutWrite = process.stdout.write;
+  const stderrWrite = process.stderr.write;
+  const text = (chunk: unknown): string =>
+    typeof chunk === "string" ? chunk : Buffer.from(chunk as Uint8Array).toString("utf-8");
+  process.stdout.write = ((chunk: unknown) => {
+    out.push(text(chunk));
+    return true;
+  }) as typeof process.stdout.write;
+  process.stderr.write = ((chunk: unknown) => {
+    err.push(text(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  let code: number;
+  try {
+    code = await step();
+  } catch (error) {
+    const said = error instanceof Error ? error.stack ?? error.message : String(error);
+    err.push(`${said.replace(/^Error: /, "error: ")}\n`);
+    code = 1;
+  } finally {
+    process.stdout.write = stdoutWrite;
+    process.stderr.write = stderrWrite;
+  }
+  return { stdout: out.join(""), stderr: err.join(""), code };
 }
 
 // --- Hook drop counter ---
@@ -40907,6 +41463,19 @@ export function ceremonyPolicyValues(
   };
 }
 
+// Whether a stage's run lists the learnings ritual: the ceremony is on, and
+// the gate is at its first showing, never again for a revision of it
+// (stage-protocol.md, Request Changes). The run-stage directive and the
+// review verdict's next step both read it here.
+export function learningsRitualRuns(
+  learnings: CeremonyPolicy["learnings"],
+  stateContent: string | null | undefined,
+  slug: string,
+): boolean {
+  if (learnings !== "on") return false;
+  return !stateContent || parseCheckboxes(stateContent).find((row) => row.slug === slug)?.state !== "revising";
+}
+
 // --- Answer mode (stage-protocol.md section 3, Step 2) ---
 //
 // How the person answers a stage's questions: Guide me, I'll edit the file, or
@@ -40918,8 +41487,12 @@ export type AnswerModeChoice = "guide" | "file" | "chat";
 export const ANSWER_MODE_FIELD = "Answer Mode";
 /** The DECISION_RECORDED field naming which of the engine's own questions a row is. */
 export const QUESTION_KIND_FIELD = "Question Kind";
+/** The learnings ritual's "Anything to add?" options (stage-protocol-learnings.md section 13). */
+export const LEARNINGS_NOTE_CHOICES = ["Nothing to add", "Add a note"] as const;
 /** Its value for the mode question, written by the command the step note hands the agent. */
 export const ANSWER_MODE_QUESTION_KIND = "answer-mode";
+/** Its value for the learnings ritual's "Anything to add?", written by the command that module names. */
+export const LEARNINGS_NOTE_QUESTION_KIND = "learnings-note";
 export const ANSWER_MODE_LABELS: Record<AnswerModeChoice, string> = {
   guide: "Guide me",
   file: "I'll edit the file",
@@ -40941,6 +41514,17 @@ export function isAnswerModeDecision(block: string): boolean {
   const offered = (auditBlockField(block, "Options") ?? "").split(",").map(plain).filter((option) => option !== "");
   const labels = Object.values(ANSWER_MODE_LABELS).map(plain);
   return offered.length === labels.length && labels.every((label) => offered.includes(label));
+}
+/**
+ * True when a DECISION_RECORDED block is the learnings ritual's "Anything to
+ * add?": its Question Kind says so. A row recorded before that field existed
+ * is that question when it offers exactly the ritual's two choices.
+ */
+export function isLearningsNoteDecision(block: string): boolean {
+  const kind = auditBlockField(block, QUESTION_KIND_FIELD);
+  if (kind !== null) return kind === LEARNINGS_NOTE_QUESTION_KIND;
+  return (auditBlockField(block, "Options") ?? "").split(",").map((option) => option.trim()).join(",") ===
+    LEARNINGS_NOTE_CHOICES.join(",");
 }
 const ANSWER_MODE_OTHERS: Record<AnswerModeChoice, string> = {
   guide: "edit the file or chat",
@@ -41337,6 +41921,28 @@ export const GUARD_FENCE_LABELS: Record<GuardFence, string> = {
   "reviewer-scope": "Reviewer read scope (a dispatched reviewer outside its unit)",
   "human-presence": "Human presence (a real human turn behind approvals and answers)",
 };
+
+/**
+ * The stage-status verbs only the engine runs. The state tool refuses each one
+ * from any other caller, whatever spelling ran it; the hooks and adapters that
+ * name these verbs read this set.
+ */
+export const ENGINE_OWNED_STATE_TRANSITIONS: ReadonlySet<string> = new Set([
+  "set",
+  "checkbox",
+  "advance",
+  "finalize",
+  "complete-workflow",
+  "gate-start",
+  "approve",
+  "reject",
+  "revise",
+  "skip",
+  "park",
+  "refresh-unit-progress",
+  "sync-unit-scope-stage",
+  "fold-unit-merge",
+]);
 
 /** The fences the policy word lowers by itself. */
 export function fencesLoweredByPolicy(policy: GuardPolicy): readonly GuardFence[] {
@@ -43689,7 +44295,6 @@ export type BoltDagResolution =
       batches: string[][];
       units: string[];
       unitKinds: Map<string, string> | null;
-      healed: boolean;
     }
   | { state: "none" }
   | { state: "malformed"; reason: string; detail: string };
@@ -43764,7 +44369,6 @@ export function resolveBoltDag(
             batches: typedBatches,
             units,
             unitKinds: unitKinds.size > 0 ? unitKinds : null,
-            healed: false,
           };
         }
       }
@@ -43796,7 +44400,6 @@ export function resolveBoltDag(
     batches: parsed.batches,
     units: parsed.batches.flat(),
     unitKinds: unitKinds.size > 0 ? unitKinds : null,
-    healed: true,
   };
   return cached !== null && boltDagMatches(cached, authored) ? cached : authored;
 }
