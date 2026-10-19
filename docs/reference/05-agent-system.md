@@ -40,6 +40,7 @@ tier: judgment
 | `disallowedTools` | Yes in authored core | Must include `Task` -- only the conductor delegates. The packager removes or translates this Claude-dialect key when a harness uses a different native tool-policy surface |
 | `tier` | Yes | `judgment`, `balanced`, or `templated`. The AUTHORED dial: the packager projects it into each harness's native model/effort keys (see Agent Tiers below). Raw `model:`/`effort:` never appear in authored frontmatter -- they are projection OUTPUTS in the ignored local `dist/<harness>/` tree and versioned release runtime. |
 | `slot` | No | The agent slot the persona opens. Only `aidlc-aws-platform-agent` carries one: `slot: cloud-platform`. See Agent Slots below |
+| `supports` | No | Plugin personas only: the stages the persona stands beside, as a list of stage slugs. See Agent Supports below |
 
 ### Agent Slots
 
@@ -60,6 +61,23 @@ Design, Infrastructure Design, Environment Provisioning, and Feedback &
 Optimization). The first-party `azure` and `gcp` plugins fill it, and
 `aidlc config project --cloud <aws|azure|gcp>` chooses which one is on (see
 [The Plugin Mechanism](18-plugin-mechanism.md#agent-slots)).
+
+### Agent Supports
+
+A plugin persona may stand beside a stage's agents instead of replacing one: it
+lists the stages in `supports:` and, while its plugin is on, graph compile
+(`resolveAgentSupports` in `core/tools/aidlc-lib.ts`, applied by
+`compileStageGraph` after the slots) adds it last in each stage's
+`support_agents`. The core persona keeps its seat, so a cloud specialist carries
+only what its cloud adds and the generic persona's method and knowledge keep
+flowing from core. Only a plugin persona may declare `supports` (the loader
+refuses it on a core persona), only a stage that runs `inline` takes one (a
+stage that dispatches its agents needs a native surface a plugin persona lacks
+on some harnesses), and a persona that already leads the stage is not named
+twice. A stage name no stage carries is skipped, so a core rename cannot break
+an install; the plugin's own tests name it. Stage source is never edited, so
+turning the plugin off and recompiling gives the stages back to core. See
+[The Plugin Mechanism](18-plugin-mechanism.md#agent-supports).
 
 Kiro IDE projects this core contract differently: it removes
 `disallowedTools`, adds `tools: ["read", "write", "shell"]`, and adds

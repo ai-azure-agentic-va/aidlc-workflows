@@ -95,6 +95,7 @@ import {
   noteGuardPolicyRename,
   parseGuardPolicy,
   resolveAgentSlots,
+  resolveAgentSupports,
   resolveProjectDir,
   resolveProjectFlag,
   resolveWorkflowSelection,
@@ -2466,6 +2467,25 @@ function applyAgentSlots(stages: GraphStage[]): void {
   }
 }
 
+// A plugin persona that lists a stage in `supports:` joins that stage's
+// support agents while its plugin is on (resolveAgentSupports). Only an inline
+// stage takes one: a stage that dispatches its agents needs a native surface a
+// plugin persona lacks on some harnesses. A stage name no stage carries is
+// skipped, so a core rename cannot break an install; the plugin's own tests
+// name it.
+function applyAgentSupports(stages: GraphStage[]): void {
+  const supports = resolveAgentSupports();
+  if (supports.size === 0) return;
+  for (const stage of stages) {
+    if (stage.mode !== "inline") continue;
+    for (const agent of supports.get(stage.slug) ?? []) {
+      if (stage.lead_agent !== agent && !stage.support_agents.includes(agent)) {
+        stage.support_agents.push(agent);
+      }
+    }
+  }
+}
+
 function validateSelectionClosure(stages: GraphStage[]): void {
   const producersByArtifact = new Map<string, GraphStage[]>();
   for (const stage of stages) {
@@ -2820,6 +2840,7 @@ export function compileStageGraph(): {
 
   applyPluginSelection(stages);
   applyAgentSlots(stages);
+  applyAgentSupports(stages);
   validateSelectionClosure(stages);
 
   // Edge-local invariant: for every edge A in B.requires_stage,

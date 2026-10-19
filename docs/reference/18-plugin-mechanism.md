@@ -543,6 +543,7 @@ fragments:                    # PROSE — spliced into the stage body
 | Inject phase policy / guardrails | ship `memory/phases/<p>.md` into the default-space seed (§7) | ⏳ deferred (not yet projected) |
 | Enrich a core persona (a collaboration bullet, a mandatory anchor) | `contributions/agents/<agent>.md` with `fragments` at `in:<H2>`, `after-preflight` or `end-of-body` | ✅ implemented (prose only; `adds.*` is refused with an advisory drop) |
 | Take the seat a core persona opens (the cloud platform) | a plugin agent with `slot: <name>` ([Agent slots](#agent-slots)) | ✅ implemented |
+| Stand a specialist beside a stage's agents | a plugin agent with `supports: [<stage>, ...]` ([Agent supports](#agent-supports)) | ✅ implemented |
 
 ## 7. Method/rules, agents, knowledge, scopes, and activation
 
@@ -651,6 +652,44 @@ compose fails closed: only a stage with an explicit `mode: inline` scalar and no
 upgrade cannot remove a stage composed by an older hook, so an existing stage
 that fails these dispatch checks remains on disk but emits a degraded health row
 naming the remediation.
+
+### Agent supports
+
+A plugin persona may also stand **beside** the agents of a core stage without
+taking anyone's seat. It lists the stages in its own frontmatter:
+
+```yaml
+slot: ...            # optional; a seat it takes
+supports:
+  - infrastructure-design
+  - nfr-requirements
+```
+
+While its plugin is enabled, graph compile adds the persona last in each listed
+stage's `support_agents`, after the slots resolve; stage source is untouched, so
+a disabled plugin compiles back to core with no strip step and nothing is
+recorded in the contribution sidecar. The rules: only a plugin persona may
+declare `supports` (the loader refuses it on a core persona); only a stage that
+runs `inline` takes one, because a stage that dispatches its agents (`subagent`,
+`pipeline`, `mob`) needs a native dispatch surface a plugin persona lacks on
+Kiro CLI and Codex; a persona that already leads the stage (a seat filler on a
+stage it supports) is not named twice; and a stage name no stage carries is
+skipped rather than failing the compile, so an upstream rename cannot break an
+install. A plugin's own tests are where such a rename shows: the shared cloud
+suite asserts that every stage a specialist supports exists, runs inline, and
+still names the core persona of the same trade.
+
+Use a slot to replace the one persona that is the cloud's trade (the platform
+engineer); use `supports` for the trades that are generic in core and only
+differ in the cloud's services. The first-party `azure` and `gcp` plugins carry
+four specialists each, none of which replaces a core persona:
+
+| Specialist | Stands beside | On stages |
+|------------|---------------|-----------|
+| `<cloud>-security-agent` | `aidlc-devsecops-agent` | Environment Provisioning, Infrastructure Design, NFR Requirements |
+| `<cloud>-compliance-agent` | `aidlc-compliance-agent` | Environment Provisioning, Feasibility, Infrastructure Design, NFR Requirements |
+| `<cloud>-operations-agent` | `aidlc-operations-agent` | Feedback & Optimization, Incident Response, Observability Setup |
+| `<cloud>-pipeline-deploy-agent` | `aidlc-pipeline-deploy-agent` | CI Pipeline, Deployment Execution, Deployment Pipeline |
 
 **Knowledge = methodology only** *(✅ projected + composed).* A plugin ships
 per-agent methodology knowledge into `knowledge/<agent-slug>/`, composed into

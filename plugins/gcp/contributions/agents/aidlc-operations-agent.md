@@ -14,4 +14,4 @@ fragments:
 
 ## fragment: in:Collaboration
 
-- **Works with (gcp)**: gcp-platform-agent (provisioned Google Cloud resources, log buckets and sinks, autoscaling settings)
+- **Works with (gcp)**: gcp-platform-agent (provisioned Google Cloud resources, log buckets and sinks, autoscaling settings), gcp-operations-agent (Google Cloud Observability signals, alerting policies, SLOs, and cost signals; it owns how this persona's method lands on Google Cloud)

@@ -343,6 +343,39 @@ fill the same slot: compile refuses both, and `aidlc config project --cloud`
 chooses among cloud plugins. See
 [Agent slots](../reference/18-plugin-mechanism.md#agent-slots).
 
+### Stand a specialist beside a stage's agents
+
+A slot replaces a persona. When the trade is generic in core and only the
+services differ (security, compliance, operations, deployment), ship a
+specialist that stands **beside** the core persona instead, so the core
+persona's method and knowledge keep flowing and yours carries only what your
+domain adds:
+
+```yaml
+---
+name: azure-security-agent
+display_name: Azure Security Agent
+plugin: azure
+supports:
+  - infrastructure-design
+  - environment-provisioning
+  - nfr-requirements
+description: >
+  Azure security specialist who stands beside the DevSecOps Agent ...
+disallowedTools: Task
+tier: judgment
+---
+```
+
+While the plugin is on, graph compile adds the persona last in each listed
+stage's `support_agents`; turn the plugin off and the stages are core again.
+List only stages that run `inline` (a stage that dispatches its agents needs a
+native surface a plugin persona does not have on every harness), and ship the
+specialist's knowledge under `knowledge/<agent>/`. A stage name that does not
+exist is skipped at compile, so give your plugin a test that names each stage
+(the shared cloud suite in `tests/harness/cloud-plugin-suite.ts` does). See
+[Agent supports](../reference/18-plugin-mechanism.md#agent-supports).
+
 ### Engine upgrade lifecycle
 
 An engine reinstall copies the stock `dist/<harness>/` graph and core stage

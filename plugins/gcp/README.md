@@ -10,16 +10,25 @@
   slot. While the plugin is on, it leads Infrastructure Design and Environment
   Provisioning and supports Feasibility, Domain Design, Contract Design, NFR
   Design, and Feedback & Optimization, in place of `aidlc-aws-platform-agent`.
+- **Ships four specialists** that stand beside the core persona of the same
+  trade on the cloud stages and replace none of them: `gcp-security-agent`
+  (beside DevSecOps), `gcp-compliance-agent` (beside Compliance),
+  `gcp-operations-agent` (beside Operations), and
+  `gcp-pipeline-deploy-agent` (beside Pipeline & Deploy). Each lists its
+  stages in `supports:`, so graph compile adds it to them while the plugin is
+  on ([Agent supports](../../docs/reference/18-plugin-mechanism.md#agent-supports)).
+  The core persona keeps its method and knowledge; the specialist carries only
+  what Google Cloud adds.
 - **Ships its knowledge**: the Google Cloud Well-Architected Framework, a
   Google Cloud infrastructure guide, Terraform practice, and Google Cloud cost
   patterns.
 - **Adds Google Cloud notes** where core text names AWS services: the
-  Operations and Pipeline & Deploy personas, and the Feasibility, Environment
+  Operations, Pipeline & Deploy, DevSecOps, and Compliance personas, and the Feasibility, Environment
   Provisioning, and Feedback & Optimization stages. Each note is one short
   paragraph that says which Google Cloud service to read for each AWS one.
 
 It adds no stages, scopes, or sensors, and it changes no core file: turning it
-off gives every stage back to the AWS agent and removes its notes.
+off gives every stage back to the AWS agent and removes its specialists and notes.
 
 ## 2. How to use it
 
@@ -53,9 +62,10 @@ then run the same `--cloud`. For Claude Code:
 plugins/gcp/
   .aidlc-plugin/plugin.json                     # manifest
   agents/gcp-platform-agent.md                  # the persona (slot: cloud-platform)
+  agents/gcp-<trade>-agent.md                  # four specialists (supports: [stages]): security, compliance, operations, pipeline-deploy
   knowledge/gcp-platform-agent/*.md             # its methodology knowledge
-  contributions/agents/aidlc-operations-agent.md
-  contributions/agents/aidlc-pipeline-deploy-agent.md
+  knowledge/gcp-<trade>-agent/*.md            # each specialist's knowledge
+  contributions/agents/aidlc-{operations,pipeline-deploy,devsecops,compliance}-agent.md
   contributions/ideation/feasibility.md
   contributions/operation/environment-provisioning.md
   contributions/operation/feedback-optimization.md

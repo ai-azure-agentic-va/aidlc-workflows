@@ -38641,6 +38641,9 @@ export interface AgentMetadata {
   // The agent slot the persona opens (core) or fills (plugin); see
   // resolveAgentSlots.
   slot?: string;
+  // The stages a plugin persona stands beside (plugin only); see
+  // resolveAgentSupports.
+  supports?: string[];
 }
 
 // .claude/agents/ holds one <slug>.md per persona. AIDLC_AGENTS_DIR env-var
@@ -38775,6 +38778,21 @@ function parseAgentFrontmatter(path: string): AgentMetadata {
     }
     agent.slot = slot;
   }
+  const supports = listField(fm, "supports");
+  if (supports.length > 0) {
+    if (!plugin) {
+      throw new Error(
+        `Agent file ${path} declares supports; only a plugin persona stands beside a core stage's agents.`
+      );
+    }
+    const bad = supports.find((stage) => !/^[a-z][a-z0-9-]*$/.test(stage));
+    if (bad) {
+      throw new Error(
+        `Agent file ${path} supports "${bad}"; a stage name is lowercase letters, digits, and dashes.`
+      );
+    }
+    agent.supports = supports;
+  }
   return agent;
 }
 
@@ -38876,6 +38894,25 @@ export function resolveAgentSlots(
       };
     })
     .sort((a, b) => a.slot.localeCompare(b.slot));
+}
+
+/** The plugin personas that stand beside a stage's agents, by stage. A plugin
+ *  persona lists the stages it supports with `supports:`; while its plugin is
+ *  enabled, graph compile adds it to each stage's support_agents. Unlike a
+ *  slot it replaces no one: the core persona keeps working beside it, so a
+ *  cloud specialist carries only what its cloud adds. */
+export function resolveAgentSupports(
+  agents: readonly AgentMetadata[] = loadAgents(),
+  enabled: (plugin: string) => boolean = isPluginEnabled,
+): Map<string, string[]> {
+  const byStage = new Map<string, string[]>();
+  for (const agent of agents) {
+    if (agent.plugin === undefined || !enabled(agent.plugin)) continue;
+    for (const stage of agent.supports ?? []) {
+      byStage.set(stage, [...(byStage.get(stage) ?? []), agent.slug]);
+    }
+  }
+  return byStage;
 }
 
 export function frontmatterBlock(body: string): string | null {

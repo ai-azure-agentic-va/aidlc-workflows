@@ -14,4 +14,4 @@ fragments:
 
 ## fragment: in:Collaboration
 
-- **Works with (gcp)**: gcp-platform-agent (target projects, deployment service accounts and their roles, environment endpoints)
+- **Works with (gcp)**: gcp-platform-agent (target projects, deployment service accounts and their roles, environment endpoints), gcp-pipeline-deploy-agent (Workload Identity Federation, Cloud Build, Artifact Registry, Cloud Deploy, rollouts, and Binary Authorization; it owns how this persona's method lands on Google Cloud)
