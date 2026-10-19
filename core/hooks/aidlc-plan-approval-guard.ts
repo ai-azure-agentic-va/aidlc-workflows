@@ -31,7 +31,8 @@
 // receipt) waits while the plan does (the person's answer at the held gate and
 // the recovery remedy they picked excepted); a jump waits for the person's
 // move: the restart they picked at the recovery question, or one they asked
-// for while the last step is current. While the person is editing the plan
+// for, unless the engine's last step was superseded or is its Code Generation
+// recovery question. While the person is editing the plan
 // files themselves, those files are theirs (personIsEditingPlanFile). Three
 // kinds of files pass too: the composer's grid proposal, a person's answer text
 // and a person's request file, which the engine reads and nothing else.
@@ -112,6 +113,7 @@ import {
   personAskedSinceGate,
   personSpokeSinceGate,
   readActiveDirectiveMarker,
+  readIssuedDirectiveMarker,
   spacesRoot,
   activeDirectiveOutOfDateReason,
   recordHookDrop,
@@ -141,6 +143,7 @@ import {
   evaluateCodeGenerationApproval,
   planReviewAppendix,
   promptTestingContractMarkers,
+  setAsideBuildUnderOff,
   WORKER_BRIEF_SECTIONS,
 } from "../tools/aidlc-testing-posture.ts";
 import { refuseRuntimeIntegrityViolation } from "./runtime-integrity.ts";
@@ -771,9 +774,9 @@ function planAppendixFor(projectDir: string, unit: string | null): string | unde
   }
 }
 
-export function gatherUnitEvidence(projectDir: string, units: string[]): UnitEvidence[] {
+export function gatherUnitEvidence(projectDir: string, units: string[], issued?: CodeGenerationIssuance): UnitEvidence[] {
   return units.map((unit) => {
-    const approval = evaluateCodeGenerationApproval(projectDir, { unit });
+    const approval = evaluateCodeGenerationApproval(projectDir, { unit }, issued);
     const reviewAppendix = planAppendixFor(projectDir, unit);
     return {
       unit,
@@ -790,8 +793,8 @@ export function gatherUnitEvidence(projectDir: string, units: string[]): UnitEvi
   });
 }
 
-export function gatherApprovalEvidence(projectDir: string, units: string[]): UnitEvidence[] {
-  const stageApproval = evaluateCodeGenerationApproval(projectDir, { unit: null });
+export function gatherApprovalEvidence(projectDir: string, units: string[], issued?: CodeGenerationIssuance): UnitEvidence[] {
+  const stageApproval = evaluateCodeGenerationApproval(projectDir, { unit: null }, issued);
   const reviewAppendix = planAppendixFor(projectDir, null);
   return [
     {
@@ -806,7 +809,7 @@ export function gatherApprovalEvidence(projectDir: string, units: string[]): Uni
       ...(stageApproval.ok ? {} : { reason: stageApproval.reason }),
       ...(reviewAppendix === undefined ? {} : { reviewAppendix }),
     },
-    ...gatherUnitEvidence(projectDir, units),
+    ...gatherUnitEvidence(projectDir, units, issued),
   ];
 }
 
@@ -1472,17 +1475,21 @@ interface EngineCommandContext {
 
 const NO_ENGINE_CONTEXT: EngineCommandContext = { gateHeld: false, marker: null, jumpAdmitted: () => false };
 
-// The engine's last step is current and was delivered as issued, and it is not
-// its recovery question, whose own picked restart is the one jump it carries out
-// (isSelectedGuardRestartContinuation). A step gone stale or superseded since
-// names nothing the person's earlier words still ask for: `next` names the step
-// now. Parked work's last step is the park, which no issued step outlives.
+// The engine's last step was delivered as issued, and it is not its Code
+// Generation recovery question, whose own picked restart is the one jump it
+// carries out (isSelectedGuardRestartContinuation), bound to the state it was
+// picked at. The report that opens the gate moves the state and writes no step,
+// so the step the person answers there is the one the engine issued last
+// (readIssuedDirectiveMarker); whether their words still stand is
+// personSpokeSinceGate's. With no step on record there is nothing to wait for.
+// Parked work's last step is the park, which no issued step outlives.
 function lastStepAdmitsPersonsMoves(projectDir: string): boolean {
   try {
     const state = readFileSync(stateFilePath(projectDir), "utf-8");
     if ((getField(state, "Parked") ?? "").trim().length > 0) return true;
-    const marker = readActiveDirectiveMarker(projectDir, state);
-    return marker !== null && marker.delivery !== "superseded" &&
+    const marker = readActiveDirectiveMarker(projectDir, state) ?? readIssuedDirectiveMarker(projectDir);
+    if (marker === null) return true;
+    return marker.delivery !== "superseded" &&
       !(marker.kind === "ask" && marker.ask_type === GUARD_RECOVERY_ASK_TYPE);
   } catch {
     return false;
@@ -1490,8 +1497,9 @@ function lastStepAdmitsPersonsMoves(projectDir: string): boolean {
 }
 
 // A jump is the person's move: the restart they picked at the engine's recovery
-// question, or one they asked for since the last decision while the last step
-// is current. The jump tool checks neither.
+// question, or one they asked for since the last decision, unless the engine's
+// last step was superseded or is its Code Generation recovery question. The jump
+// tool checks neither.
 function jumpIsPersonsMove(
   projectDir: string,
   cwd: string,
@@ -1920,6 +1928,30 @@ function recordGuardDisabled(input: string): void {
   }
 }
 
+// The row a set-aside build step's pass leaves, the stand-aside account of
+// what the lowered fence let through. Nothing is said: under Guard Policy off
+// the row is the whole account, and a ledger that cannot take it never stops
+// the build (the doctor lists the miss).
+function recordSetAsidePass(
+  projectDir: string,
+  hookInput: ClaudeCodeHookInput,
+  issued: NonNullable<ReturnType<typeof setAsideBuildUnderOff>>,
+  details: string,
+): void {
+  try {
+    const target = { unit: issued.unit?.trim() || null };
+    const gate = codeGenerationPlanApprovalFence(projectDir, target, { hookInput });
+    const recorded = recordGuardStoodAside(projectDir, {
+      fence: "plan-approval", authority: gate.authority, stage: GUARDED_STAGE, tool: hookInput.tool_name ?? "", details,
+    });
+    if (!recorded) {
+      recordHookDrop(projectDir, HOOK_NAME, `GUARD_STOOD_ASIDE row not recorded (audit ledger busy or not writable): ${details}`);
+    }
+  } catch (e) {
+    recordHookDrop(projectDir, HOOK_NAME, errorMessage(e));
+  }
+}
+
 export async function run(input: string): Promise<number> {
   let parsed: ClaudeCodeHookInput;
   try {
@@ -2022,6 +2054,12 @@ async function evaluate(
   // admits: the refusal stands with the fence on, and a lowered fence stands
   // aside for it as for any other write of an approved plan.
   let swarmBatchOut = false;
+  // Under Guard Policy off, the build step a compaction or a state sync set
+  // aside since it was issued, when the person's approval for it still stands:
+  // the last instruction on record, so its work goes on as it did before.
+  let setAside: ReturnType<typeof setAsideBuildUnderOff> = null;
+  // Why that step went out of date, for the row its pass leaves.
+  let setAsideWhy = "";
   // Plain sentences: some hosts (Codex) show a hook's refusal to the person as
   // it is written. A path or command the reason quotes stays on the one line.
   // biome-ignore lint/suspicious/noControlCharactersInRegex: replacing them is the point
@@ -2057,8 +2095,14 @@ async function evaluate(
     const activeDirective = readActiveDirectiveMarker(projectDir, state);
     const durableStage = normalizeStageName(currentStage);
     const directiveStage = normalizeStageName(activeDirective?.stage ?? "");
+    setAside = activeDirective?.version === 2 && directiveStage === GUARDED_STAGE
+      ? setAsideBuildUnderOff(projectDir, activeDirective)
+      : null;
+    if (setAside !== null) {
+      setAsideWhy = activeDirectiveOutOfDateReason(activeDirective) ?? "the Code Generation step went out of date";
+    }
     const issuance = activeDirective?.version === 2 && directiveStage === GUARDED_STAGE
-      ? codeGenerationIssuance(activeDirective)
+      ? codeGenerationIssuance(activeDirective) ?? setAside
       : null;
     if (issuance !== null) briefTargets = issuanceTargets(issuance);
     const dispatchPrompt = [toolInput.prompt, toolInput.description]
@@ -2170,7 +2214,7 @@ async function evaluate(
       verdict = { block: true, mentioned: [] };
     } else {
       const recordDir = docsRoot(projectDir);
-      units = gatherApprovalEvidence(projectDir, knownUnits(projectDir, recordDir));
+      units = gatherApprovalEvidence(projectDir, knownUnits(projectDir, recordDir), setAside ?? undefined);
       if (guardedDispatch) {
         verdict = evaluatePlanApprovalDispatch(toolName, subagentType, dispatchPrompt, {
           currentStage: activeDirective.stage,
@@ -2186,7 +2230,7 @@ async function evaluate(
           standing = planStanding(projectDir, activeDirective);
         } else if (
           verdict.handoff &&
-          briefTargets?.every((unit) => codeGenerationExecutionAllowed(projectDir, { unit }))
+          briefTargets?.every((unit) => codeGenerationExecutionAllowed(projectDir, { unit }, undefined, setAside ?? undefined))
         ) {
           handoffDefect = verdict.handoff;
         }
@@ -2275,21 +2319,21 @@ async function evaluate(
           opaqueShell: mutation.targets.length === 0,
           detail: null,
         };
-      } else if (activeDirective.kind !== "run-stage") {
+      } else if (activeDirective.kind !== "run-stage" && setAside === null) {
         authorityFailure =
           `workspace mutation cannot select one approval target from directive kind "${activeDirective.kind}"` +
           outOfDateClause(activeDirective);
         standing = planStanding(projectDir, activeDirective);
         verdict = { block: true, mentioned: [] };
       } else {
-        const unit = activeDirective.unit?.trim() || null;
+        const unit = (setAside ?? activeDirective).unit?.trim() || null;
         const target: CodeGenerationTarget = { unit };
         const approvalDir = resolve(codeGenerationRecordDir(projectDir, unit));
         const outsideRecord = mutation.targets.find(
           (candidate) => !isTrustedRecordTarget(projectDir, candidate, approvalDir),
         );
         if (!outsideRecord && !mutation.opaqueShell) return 0;
-        const approval = evaluateCodeGenerationApproval(projectDir, target);
+        const approval = evaluateCodeGenerationApproval(projectDir, target, setAside ?? undefined);
         const evidence: UnitEvidence = {
           unit,
           planExists: approval.planExists,
@@ -2383,12 +2427,14 @@ async function evaluate(
         const targets = verdict.mentioned.map((mentioned) => ({
           unit: mentioned === `stage:${GUARDED_STAGE}` ? null : mentioned,
         }));
-        changeNotices.push(...beginCodeGenerationBatch(projectDir, targets));
+        changeNotices.push(...beginCodeGenerationBatch(projectDir, targets, {}, setAside ?? undefined));
       } else if (blockedMutation === null) {
         const state = readFileSync(stateFilePath(projectDir), "utf-8");
         const marker = readActiveDirectiveMarker(projectDir, state);
         if (marker?.version === 2 && marker.kind === "run-stage") {
           changeNotices.push(...beginCodeGeneration(projectDir, { unit: marker.unit?.trim() || null }));
+        } else if (setAside !== null) {
+          changeNotices.push(...beginCodeGeneration(projectDir, { unit: setAside.unit?.trim() || null }, {}, setAside));
         }
       }
     } catch (e) {
@@ -2399,6 +2445,9 @@ async function evaluate(
     }
     if (!verdict.block) {
       for (const notice of changeNotices) process.stdout.write(`${notice}\n`);
+    }
+    if (!verdict.block && setAside !== null) {
+      recordSetAsidePass(projectDir, parsed, setAside, `${guardedDispatch ? `dispatch of ${subagentType}` : toolName}; ${setAsideWhy}`);
     }
   }
   if (!verdict.block) return 0;
@@ -2432,36 +2481,38 @@ async function evaluate(
       if (verdict.mentioned.length === 0) {
         return refuseExecutionIneligible(refusalProse(null), false);
       }
+      const issued = setAside ?? undefined;
       const selected = verdict.mentioned.map((mentioned) => {
         const target = { unit: mentioned === `stage:${GUARDED_STAGE}` ? null : mentioned };
-        return { target, approval: evaluateCodeGenerationApproval(projectDir, target) };
+        return { target, approval: evaluateCodeGenerationApproval(projectDir, target, issued) };
       });
       // Lowering this fence permits changed content after initial approval.
       // It does not supply missing approval, artifacts, target or attempt
       // authority. Validate the whole selection before publishing any start.
       for (const { target, approval } of selected) {
         if (approval.executionFailure) return refuseProvenanceFailure(approval.executionFailure);
-        if (!codeGenerationExecutionAllowed(projectDir, target, approval)) {
+        if (!codeGenerationExecutionAllowed(projectDir, target, approval, issued)) {
           return refuseExecutionIneligible(refusalProse(approval.reason || null), false);
         }
       }
       // A blocked path is written the way the write-audit hook writes one
       // (forward slashes, upper-case drive), so the ledger reads the same on
       // every platform. A shell command stays verbatim: its backslashes are text.
-      const detail = guardedDispatch
+      const called = guardedDispatch
         ? `dispatch of ${subagentType}`
         : blockedMutation
           ? blockedMutation.opaqueShell
             ? blockedMutation.target
             : normalizeDriveLetter(blockedMutation.target.replace(/\\/g, "/"))
           : toolName;
+      const detail = setAside === null ? called : `${called}; ${setAsideWhy}`;
       // A lowered fence keeps its permission decision, but an existing genuine
       // approval still needs source provenance before execution. Reuse the
       // locked start transaction even when edited content made the verdict fail.
       // This hook emits its own stand-aside row below, so begin only reports drift.
       try {
         for (const notice of beginCodeGenerationBatch(
-          projectDir, selected.map(({ target }) => target), { recordContinuation: false },
+          projectDir, selected.map(({ target }) => target), { recordContinuation: false }, issued,
         )) {
           process.stdout.write(`${notice}\n`);
         }
