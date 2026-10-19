@@ -95,6 +95,7 @@ import {
   noteGuardPolicyRename,
   parseGuardPolicy,
   resolveAgentSlots,
+  resolveAgentSupports,
   resolveProjectDir,
   resolveProjectFlag,
   resolveWorkflowSelection,
@@ -2466,6 +2467,25 @@ function applyAgentSlots(stages: GraphStage[]): void {
   }
 }
 
+// A plugin persona that lists a stage in `supports:` joins that stage's
+// support agents while its plugin is on (resolveAgentSupports). Only an inline
+// stage takes one: a stage that dispatches its agents needs a native surface a
+// plugin persona lacks on some harnesses. A stage name no stage carries is
+// skipped, so a core rename cannot break an install; the plugin's own tests
+// name it.
+function applyAgentSupports(stages: GraphStage[]): void {
+  const supports = resolveAgentSupports();
+  if (supports.size === 0) return;
+  for (const stage of stages) {
+    if (stage.mode !== "inline") continue;
+    for (const agent of supports.get(stage.slug) ?? []) {
+      if (stage.lead_agent !== agent && !stage.support_agents.includes(agent)) {
+        stage.support_agents.push(agent);
+      }
+    }
+  }
+}
+
 function validateSelectionClosure(stages: GraphStage[]): void {
   const producersByArtifact = new Map<string, GraphStage[]>();
   for (const stage of stages) {
@@ -2795,7 +2815,24 @@ export function compileStageGraph(): {
 
   // Sort by numeric order (phase-prefix.index).
   stages.sort((a, b) => numericStageOrder(a.number, b.number));
-  const stockScopeNames = stageDeclaredScopeNames(stages);
+
+  // A team plugin's scope runs the base stages its include_stages names, so
+  // each included stage's row carries that scope, as if the stage named it.
+  // An include no installed stage has is left out (plugin sync holds the team
+  // plugin and says so), never an error. Such a scope counts as stage-declared
+  // even when nothing resolves, so composedFoldBack never keeps its old column
+  // as a composer-authored scope's.
+  const bySlug = new Map(stages.map((stage) => [stage.slug, stage]));
+  const includingScopes: string[] = [];
+  for (const meta of Object.values(loadScopeMetadataAll())) {
+    if (meta.includeStages === undefined) continue;
+    includingScopes.push(meta.name);
+    for (const slug of meta.includeStages) {
+      const stage = bySlug.get(slug);
+      if (stage && !(stage.scopes ?? []).includes(meta.name)) stage.scopes = [...(stage.scopes ?? []), meta.name];
+    }
+  }
+  const stockScopeNames = new Set([...stageDeclaredScopeNames(stages), ...includingScopes]);
 
   // Resolve per-stage rule chain. Strict-additive: every applicable rule
   // appears in rules_in_context (org+team+project + phase when stage's
@@ -2820,6 +2857,7 @@ export function compileStageGraph(): {
 
   applyPluginSelection(stages);
   applyAgentSlots(stages);
+  applyAgentSupports(stages);
   validateSelectionClosure(stages);
 
   // Edge-local invariant: for every edge A in B.requires_stage,

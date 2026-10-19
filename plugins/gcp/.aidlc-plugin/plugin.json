@@ -1,7 +1,7 @@
 {
   "name": "gcp",
   "version": "0.1.0",
-  "description": "Google Cloud platform plugin: a GCP Platform Agent that takes the cloud-platform seat on the platform stages, Google Cloud methodology knowledge, and Google Cloud notes for the stages and personas that name AWS services.",
+  "description": "Google Cloud platform plugin: a GCP Platform Agent that takes the cloud-platform seat on the platform stages, four GCP specialists (security, compliance, operations, pipeline-deploy) that stand beside the core personas of the same trade, Google Cloud methodology knowledge, and Google Cloud notes for the stages and personas that name AWS services.",
   "author": { "name": "AWS AIDLC" },
   "dependencies": ["core"],
   "aidlc": {
